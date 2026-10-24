@@ -92,6 +92,7 @@ grey hint shows its current value.
 | `.continue`, `.c` | resume the program and wait for the next stop |
 | `.quit`, `.q`, Ctrl-D | resume the program and exit |
 | `.where`, `.w` | show the stop again |
+| `.ls [path]` | type, fields with previews and methods of a value, or all locals |
 | Ctrl-C | clear the line, or interrupt running input |
 
 `Option` fields read as their value, or `None` as `()`. Assigning a value
@@ -152,6 +153,7 @@ It then answers requests until it is told to continue:
 | `{"complete": LINE}` | `{"start": BYTE, "completions": [{"text", "display"}]}` |
 | `{"preview": PATH}` | `{"value": TEXT}`, or `{}` if it isn't a plain path |
 | `{"describe": true}` | `{"stop": …}` with fresh previews |
+| `{"ls": path}` | `{"type", "len"?, "variant"?, "fields": [{name, type, preview}], "methods"}` or `{"error"}`. An empty path lists the locals |
 | `{"interrupt": true}` | none. Stops a running `eval`, which replies `"interrupted"` |
 | `{"continue": true}` | `{"continued": true}`, then the program resumes |
 

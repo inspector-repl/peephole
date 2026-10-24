@@ -7,6 +7,9 @@ use bevy_reflect::{PartialReflect, ReflectRef};
 use rhai::Dynamic;
 use serde_json::{Value, json};
 
+const LS_WIDTH: usize = 60;
+const LS_ITEMS: usize = 20;
+
 const KEYWORDS: &[&str] = &[
     "let", "const", "if", "else", "for", "in", "while", "loop", "break", "continue", "return",
     "fn", "true", "false", "print", "debug",
@@ -77,14 +80,117 @@ pub fn is_path(code: &str) -> bool {
 }
 
 /// Looks up a path without running code, so it has no side effects.
-pub fn path(session: &Session, expr: &str) -> Option<Dynamic> {
-    let (root, steps) = parse(expr.trim())?;
-    let mut value = session.scope.get_value::<Dynamic>(root)?;
+fn lookup(session: &Session, expr: &str) -> Result<Dynamic, String> {
+    let (root, steps) =
+        parse(expr.trim()).ok_or("expected a variable or a path like order.items[0]")?;
+    let mut value = session
+        .scope
+        .get_value::<Dynamic>(root)
+        .ok_or_else(|| format!("no variable `{root}`"))?;
     for step in steps {
-        let mut node = value.try_cast::<Node>()?;
-        value = node::step(&mut node, &step).ok()?;
+        let mut node = value
+            .try_cast::<Node>()
+            .ok_or("only program values have fields")?;
+        value = node::step(&mut node, &step).map_err(|err| match *err {
+            rhai::EvalAltResult::ErrorRuntime(message, _) => message.to_string(),
+            other => other.to_string(),
+        })?;
     }
-    Some(value)
+    Ok(value)
+}
+
+pub fn path(session: &Session, expr: &str) -> Option<Dynamic> {
+    lookup(session, expr).ok()
+}
+
+/// Everything about a value at once: its type, fields with previews, and
+/// the methods that apply. Without `expr`, the stop's locals.
+pub fn ls(session: &Session, expr: &str) -> Value {
+    let entry = |name: &str, ty: &str, value: &Dynamic| {
+        let preview = if value.is_unit() && ty.starts_with("Option<") {
+            "None".to_owned()
+        } else {
+            render::preview(value, LS_WIDTH)
+        };
+        json!({"name": name, "type": ty, "preview": preview})
+    };
+    if expr.trim().is_empty() {
+        let fields: Vec<Value> = session
+            .variables
+            .iter()
+            .map(|var| {
+                let value = session
+                    .scope
+                    .get_value::<Dynamic>(var.name)
+                    .unwrap_or_default();
+                entry(var.name, &var.type_name, &value)
+            })
+            .collect();
+        let functions: Vec<String> = exposed()
+            .into_iter()
+            .map(|(name, _)| format!("{name}()"))
+            .collect();
+        return json!({"fields": fields, "functions": functions});
+    }
+    let value = match lookup(session, expr) {
+        Ok(value) => value,
+        Err(err) => return json!({"error": err}),
+    };
+    let Some(mut node) = value.clone().try_cast::<Node>() else {
+        return json!({"type": value.type_name(), "value": render::preview(&value, LS_WIDTH)});
+    };
+    let Ok(reflected) = node.get() else {
+        return json!({"error": "stale reference"});
+    };
+    let type_path = reflected.reflect_type_path().to_owned();
+    let mut shown = json!({"type": render::short_type(&type_path)});
+    let len = match reflected.reflect_ref() {
+        ReflectRef::List(l) => Some(l.len()),
+        ReflectRef::Array(a) => Some(a.len()),
+        ReflectRef::Map(m) => Some(m.len()),
+        ReflectRef::Set(s) => Some(s.len()),
+        _ => None,
+    };
+    if let Some(len) = len {
+        shown["len"] = len.into();
+    }
+    if let ReflectRef::Enum(e) = reflected.reflect_ref() {
+        shown["variant"] = e.variant_name().into();
+    }
+    let mut methods: Vec<String> = methods(reflected)
+        .into_iter()
+        .map(|(_, shown)| shown.to_owned())
+        .collect();
+    methods.extend(
+        exposed()
+            .into_iter()
+            .filter(|(_, first)| *first == type_path)
+            .map(|(name, _)| format!("{name}()")),
+    );
+    let mut children: Vec<(String, String, Option<i64>)> = node::members(reflected)
+        .into_iter()
+        .map(|(name, ty)| (name, ty, None))
+        .collect();
+    let elements: Vec<&dyn PartialReflect> = match reflected.reflect_ref() {
+        ReflectRef::List(l) => l.iter().take(LS_ITEMS).collect(),
+        ReflectRef::Array(a) => a.iter().take(LS_ITEMS).collect(),
+        _ => Vec::new(),
+    };
+    children.extend(elements.into_iter().zip(0..).map(|(element, i)| {
+        let ty = render::short_type(element.reflect_type_path());
+        (format!("[{i}]"), ty, Some(i))
+    }));
+    let fields: Vec<Value> = children
+        .iter()
+        .map(|(name, ty, index)| {
+            let step = index.map_or(Step::Member(name), Step::Index);
+            let child = node::step(&mut node, &step).unwrap_or_default();
+            entry(name, ty, &child)
+        })
+        .collect();
+    shown["fields"] = fields.into();
+    shown["methods"] = methods.into();
+    shown
 }
 
 /// The value of `text` if it is a plain path that goes past a variable.
@@ -198,6 +304,76 @@ pub fn complete(session: &Session, line: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Local;
+    use bevy_reflect::Reflect;
+
+    #[derive(Reflect)]
+    struct Item {
+        name: String,
+        qty: u32,
+    }
+
+    #[derive(Reflect)]
+    struct Order {
+        id: u64,
+        items: Vec<Item>,
+        coupon: Option<String>,
+    }
+
+    #[test]
+    fn lists_members_with_previews() {
+        let mut order = Order {
+            id: 7,
+            items: vec![Item {
+                name: "apple".into(),
+                qty: 3,
+            }],
+            coupon: None,
+        };
+        let mut locals = [Local::writable("order", &mut order)];
+        let session = Session::new(&mut locals);
+
+        let shown = ls(&session, "order");
+        assert_eq!(shown["type"], "Order");
+        assert_eq!(
+            shown["fields"][0],
+            json!({"name": "id", "type": "u64", "preview": "7"})
+        );
+        assert_eq!(
+            shown["fields"][1]["preview"],
+            r#"[Item { name: "apple", qty: 3 }]"#
+        );
+        assert!(
+            shown["methods"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("keys()"))
+        );
+
+        let items = ls(&session, "order.items");
+        assert_eq!(items["type"], "Vec<Item>");
+        assert_eq!(items["len"], 1);
+        assert!(
+            items["methods"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("len()"))
+        );
+
+        assert_eq!(
+            items["fields"][0],
+            json!({"name": "[0]", "type": "Item", "preview": r#"Item { name: "apple", qty: 3 }"#})
+        );
+        assert_eq!(shown["fields"][2]["preview"], "None");
+
+        let top = ls(&session, "");
+        assert_eq!(top["fields"][0]["name"], "order");
+        assert!(top["functions"].is_array());
+        assert_eq!(
+            ls(&session, "order.nope")["error"],
+            "no field `nope` on Order"
+        );
+    }
 
     #[test]
     fn finds_the_expression_being_typed() {

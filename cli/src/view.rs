@@ -108,10 +108,96 @@ pub fn render(stop: &Value, style: &Style) -> String {
     out
 }
 
+/// The reply to `.ls`: a header with the type, then fields and methods.
+pub fn render_ls(reply: &Value, style: &Style) -> String {
+    let mut out = String::new();
+    if let Some(err) = reply.get("error").and_then(Value::as_str) {
+        return style.paint("31", err) + "\n";
+    }
+    let ty = str_field(reply, "type");
+    if !ty.is_empty() {
+        let mut header = style.paint("36", ty);
+        if let Some(variant) = reply.get("variant").and_then(Value::as_str) {
+            let _ = write!(header, "::{variant}");
+        }
+        if let Some(len) = reply.get("len").and_then(Value::as_u64) {
+            let _ = write!(header, " · {len} items");
+        }
+        if let Some(value) = reply.get("value").and_then(Value::as_str) {
+            let _ = write!(header, " = {value}");
+        }
+        let _ = writeln!(out, "{header}");
+    }
+    let fields = reply
+        .get("fields")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let name_width = fields
+        .iter()
+        .map(|f| str_field(f, "name").len())
+        .max()
+        .unwrap_or(0);
+    let type_width = fields
+        .iter()
+        .map(|f| str_field(f, "type").chars().count())
+        .max()
+        .unwrap_or(0);
+    for field in &fields {
+        let name = format!("{:<name_width$}", str_field(field, "name"));
+        let ty = format!("{:<type_width$}", str_field(field, "type"));
+        let _ = writeln!(
+            out,
+            "  {}  {}  {}",
+            style.paint("1", &name),
+            style.paint("36", &ty),
+            str_field(field, "preview")
+        );
+    }
+    for key in ["methods", "functions"] {
+        let names: Vec<&str> = reply
+            .get(key)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        if !names.is_empty() {
+            let label = style.paint("2", &format!("{key}:"));
+            let _ = writeln!(out, "{label} {}", names.join("  "));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn renders_ls() {
+        let reply = json!({
+            "type": "Vec<Item>", "len": 2,
+            "fields": [{"name": "id", "type": "u64", "preview": "7"},
+                       {"name": "items", "type": "Vec<Item>", "preview": "[]"}],
+            "methods": ["len()", "map(|x| …)"],
+        });
+        assert_eq!(
+            render_ls(&reply, &Style { color: false }),
+            "Vec<Item> · 2 items\n  id     u64        7\n  items  Vec<Item>  []\nmethods: len()  map(|x| …)\n"
+        );
+        let top = json!({"fields": [], "functions": ["total()"]});
+        assert_eq!(
+            render_ls(&top, &Style { color: false }),
+            "functions: total()\n"
+        );
+        let missing = json!({"error": "no variable `x`"});
+        assert_eq!(
+            render_ls(&missing, &Style { color: false }),
+            "no variable `x`\n"
+        );
+    }
 
     #[test]
     fn prefers_the_programs_crate_over_the_clients_directory() {

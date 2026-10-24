@@ -30,6 +30,7 @@ change the program. Tab completes, a grey hint previews the value of a path.
   .continue, .c   resume the program and wait for the next stop
   .quit, .q       resume the program and exit (also Ctrl-D)
   .where, .w      show the stop again
+  .ls [path]      fields, previews and methods of a value, or all locals
   .help           this text
 
 Ctrl-C clears the line, or interrupts a running input.";
@@ -197,6 +198,14 @@ fn command(program: &mut Program, stop: &Value, line: &str, style: &Style) -> Ne
             print!("{}", view::render(current, style));
             Next::Stay
         }
+        ".ls" => {
+            ls(program, "", style);
+            Next::Stay
+        }
+        other if other.starts_with(".ls ") => {
+            ls(program, &other[".ls ".len()..], style);
+            Next::Stay
+        }
         ".help" | ".h" => {
             println!("{HELP}");
             Next::Stay
@@ -206,6 +215,13 @@ fn command(program: &mut Program, stop: &Value, line: &str, style: &Style) -> Ne
             Next::Stay
         }
         _ => evaluate(program, line, style),
+    }
+}
+
+fn ls(program: &mut Program, expr: &str, style: &Style) {
+    match program.request(&json!({"ls": expr.trim()})) {
+        Some(reply) => print!("{}", view::render_ls(&reply, style)),
+        None => eprintln!("{}", style.paint("31", "program disconnected")),
     }
 }
 

@@ -56,7 +56,7 @@ fn engine(output: &Rc<RefCell<String>>) -> Engine {
 }
 
 impl Session {
-    fn new(locals: &mut [Local<'_>]) -> Self {
+    pub(crate) fn new(locals: &mut [Local<'_>]) -> Self {
         let shared = Rc::new(Shared::default());
         let output = Rc::new(RefCell::new(String::new()));
         let mut scope = Scope::new();
@@ -207,6 +207,8 @@ fn serve(conn: &mut Connection, location: &Location, session: &mut Session) -> s
         } else if let Some(text) = request.get("preview").and_then(Value::as_str) {
             complete::preview(session, text, PREVIEW_WIDTH)
                 .map_or_else(|| json!({}), |value| json!({"value": value}))
+        } else if let Some(text) = request.get("ls").and_then(Value::as_str) {
+            complete::ls(session, text)
         } else if request.get("describe").is_some() {
             json!({"stop": session.describe(location)})
         } else if request.get("interrupt").is_some() {
