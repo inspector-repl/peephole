@@ -13,6 +13,7 @@
 //! `PEEPHOLE_WAIT` is set.
 
 mod complete;
+mod literal;
 mod node;
 mod render;
 mod session;

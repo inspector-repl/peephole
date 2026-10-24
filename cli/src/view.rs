@@ -4,7 +4,9 @@ use serde_json::Value;
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
-const CONTEXT: usize = 3;
+/// Like inspector: more lines before the stop than after it.
+pub const BEFORE: usize = 5;
+pub const AFTER: usize = 3;
 
 pub struct Style {
     pub color: bool,
@@ -27,7 +29,7 @@ pub fn str_field<'a>(value: &'a Value, key: &str) -> &'a str {
 /// `file!()` is relative to where rustc ran: the crate or its workspace
 /// root. The client's own directory comes last, it may hold another
 /// project with the same file names.
-fn source(stop: &Value) -> Option<PathBuf> {
+pub fn source(stop: &Value) -> Option<PathBuf> {
     let file = Path::new(str_field(stop, "file"));
     if file.is_absolute() {
         return Some(file.to_path_buf());
@@ -44,7 +46,7 @@ fn source(stop: &Value) -> Option<PathBuf> {
     candidates.into_iter().find(|path| path.is_file())
 }
 
-pub fn render(stop: &Value, style: &Style) -> String {
+pub fn render(stop: &Value, style: &Style, (before, after): (usize, usize)) -> String {
     let file = str_field(stop, "file");
     let line = stop.get("line").and_then(Value::as_u64).unwrap_or(0);
     let mut out = style.paint(
@@ -59,13 +61,13 @@ pub fn render(stop: &Value, style: &Style) -> String {
     out.push('\n');
     if let Some(text) = source(stop).and_then(|path| std::fs::read_to_string(path).ok()) {
         let line = usize::try_from(line).unwrap_or(0);
-        let first = line.saturating_sub(CONTEXT).max(1);
+        let first = line.saturating_sub(before).max(1);
         for (number, code) in text
             .lines()
             .enumerate()
             .map(|(i, l)| (i + 1, l))
             .skip(first - 1)
-            .take(2 * CONTEXT + 1)
+            .take(line + after + 1 - first)
         {
             let marker = if number == line {
                 style.paint("33", "▶")

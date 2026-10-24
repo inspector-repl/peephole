@@ -134,8 +134,11 @@ grey hint shows its current value.
 |---|---|
 | `.continue`, `.c` | resume the program and wait for the next stop |
 | `.quit`, `.q`, Ctrl-D | resume the program and exit |
-| `.where`, `.w` | show the stop again |
+| `.where`, `.w [N]` | show the stop again, with N lines of source around it |
 | `.ls [path]` | type, fields with previews and methods of a value, or all locals |
+| `.edit`, `.e` | write input in `$VISUAL`/`$EDITOR`, run it when the editor exits |
+| `.edit path` | edit a value as Rhai source, assign it back when the editor exits |
+| `.edit .` | open the source at the stop in the editor |
 | Ctrl-C | clear the line, or interrupt running input |
 
 `Option` fields read as their value, or `None` as `()`. Assigning a value
@@ -151,6 +154,11 @@ main.rs:42> order.status = #{Shipped: #{tracking: "XY1"}}
 main.rs:42> order.items = order.items.filter(|i| i.qty > 1)
 main.rs:42> order.items[0] = #{name: "fig", qty: 4, price: 1.0}
 ```
+
+`.edit order.items[0]` writes the value in this form to a file and opens
+it in the editor. If assigning it back fails, the editor opens again
+with the error on top. HashMaps and values without `Reflect` can't be
+edited this way.
 
 Lists take the length of what is assigned, the only way to grow or
 shrink them: `items = items.to_array() + [x]` appends.

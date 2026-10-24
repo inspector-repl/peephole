@@ -29,8 +29,11 @@ change the program. Tab completes, a grey hint previews the value of a path.
 
   .continue, .c   resume the program and wait for the next stop
   .quit, .q       resume the program and exit (also Ctrl-D)
-  .where, .w      show the stop again
+  .where, .w [N]  show the stop again, with N lines of source around it
   .ls [path]      fields, previews and methods of a value, or all locals
+  .edit           write input in $EDITOR, run it when the editor exits
+  .edit path      edit a value in $EDITOR, assign it back when it exits
+  .edit .         open the source at the stop in $EDITOR
   .help           this text
 
 Ctrl-C clears the line, or interrupts a running input.";
@@ -40,6 +43,8 @@ Ctrl-C clears the line, or interrupts a running input.";
 struct Program {
     conn: Option<Connection>,
     locals: Vec<String>,
+    /// What a bare `.edit` starts from.
+    last_input: String,
 }
 
 impl Program {
@@ -146,10 +151,9 @@ enum Next {
     Exit,
 }
 
-fn evaluate(program: &mut Program, code: &str, style: &Style) -> Next {
-    let Some(conn) = program.conn.as_mut() else {
-        return Next::Resume;
-    };
+/// Runs `code` and returns its error, or `None` once the program hung up.
+fn evaluate(program: &mut Program, code: &str, style: &Style) -> Option<Result<(), String>> {
+    let conn = program.conn.as_mut()?;
     interrupt::install();
     let mut interrupted = false;
     let reply = conn.send(&json!({"eval": code})).and_then(|()| {
@@ -164,11 +168,12 @@ fn evaluate(program: &mut Program, code: &str, style: &Style) -> Next {
     let Ok(Some(reply)) = reply else {
         eprintln!("{}", style.paint("31", "program disconnected"));
         program.conn = None;
-        return Next::Resume;
+        return None;
     };
     print!("{}", str_field(&reply, "output"));
     let value = str_field(&reply, "value");
-    if reply.get("error").and_then(Value::as_bool).unwrap_or(false) {
+    let failed = reply.get("error").and_then(Value::as_bool).unwrap_or(false);
+    if failed {
         eprintln!("{}", style.paint("31", value));
     } else if !value.is_empty() {
         println!(
@@ -180,7 +185,131 @@ fn evaluate(program: &mut Program, code: &str, style: &Style) -> Next {
             }
         );
     }
-    Next::Stay
+    Some(if failed {
+        Err(value.to_owned())
+    } else {
+        Ok(())
+    })
+}
+
+fn run_input(program: &mut Program, code: &str, style: &Style) -> Next {
+    code.clone_into(&mut program.last_input);
+    match evaluate(program, code, style) {
+        Some(_) => Next::Stay,
+        None => Next::Resume,
+    }
+}
+
+/// Runs $VISUAL or $EDITOR, which may carry flags, through the shell
+/// like git does. True if it exited successfully.
+fn run_editor(args: &[&str]) -> bool {
+    std::process::Command::new("/bin/sh")
+        .args(["-c", r#"exec ${VISUAL:-${EDITOR:-vi}} "$@""#, "sh"])
+        .args(args)
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// `None` if the editor failed or left the file empty.
+fn edit_text(text: &str) -> Option<String> {
+    let path = std::env::temp_dir().join(format!(
+        "peephole-{}-{}.rhai",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .and_then(|mut file| io::Write::write_all(&mut file, text.as_bytes()))
+        .ok()?;
+    let edited = run_editor(&[&path.to_string_lossy()])
+        .then(|| std::fs::read_to_string(&path).ok())
+        .flatten();
+    let _ = std::fs::remove_file(&path);
+    edited
+        .map(|text| text.trim_end().to_owned())
+        .filter(|text| !text.trim().is_empty())
+}
+
+fn edit_input(program: &mut Program, style: &Style) -> Next {
+    let seed = if program.last_input.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", program.last_input)
+    };
+    let Some(code) = edit_text(&seed) else {
+        return Next::Stay;
+    };
+    println!("{}", highlight::paint(&code, &program.locals));
+    run_input(program, &code, style)
+}
+
+/// Reopens the editor with the error on top until the assignment works.
+fn edit_value(program: &mut Program, path: &str, style: &Style) -> Next {
+    let Some(reply) = program.request(&json!({"literal": path})) else {
+        return Next::Resume;
+    };
+    if let Some(err) = reply.get("error").and_then(Value::as_str) {
+        eprintln!("{}", style.paint("31", err));
+        return Next::Stay;
+    }
+    let original = str_field(&reply, "value").to_owned();
+    let mut text = format!("{original}\n");
+    loop {
+        let Some(edited) = edit_text(&text) else {
+            return Next::Stay;
+        };
+        let value = without_errors(&edited);
+        if value == original {
+            return Next::Stay;
+        }
+        let code = format!("{path} = {value}");
+        match evaluate(program, &code, style) {
+            None => return Next::Resume,
+            Some(Ok(())) => {
+                program.last_input = code;
+                return Next::Stay;
+            }
+            Some(Err(err)) => {
+                eprintln!(
+                    "{}",
+                    style.paint("2", "reopening the editor, empty it to give up")
+                );
+                text = String::new();
+                for line in err.lines() {
+                    text.push_str(ERROR_MARK);
+                    text.push_str(line);
+                    text.push('\n');
+                }
+                text.push_str(&value);
+                text.push('\n');
+            }
+        }
+    }
+}
+
+const ERROR_MARK: &str = "// peephole: ";
+
+fn without_errors(text: &str) -> String {
+    text.lines()
+        .filter(|line| !line.starts_with(ERROR_MARK))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_owned()
+}
+
+fn open_source(stop: &Value, style: &Style) {
+    let Some(path) = view::source(stop) else {
+        eprintln!("{}", style.paint("31", "source file not found"));
+        return;
+    };
+    let line = stop.get("line").and_then(Value::as_u64).unwrap_or(1);
+    run_editor(&[&format!("+{line}"), &path.to_string_lossy()]);
 }
 
 fn command(program: &mut Program, stop: &Value, line: &str, style: &Style) -> Next {
@@ -188,14 +317,39 @@ fn command(program: &mut Program, stop: &Value, line: &str, style: &Style) -> Ne
         "" => Next::Stay,
         ".continue" | ".c" => Next::Resume,
         ".quit" | ".q" => Next::Exit,
-        ".where" | ".w" => {
+        ".edit" | ".e" => edit_input(program, style),
+        ".edit ." | ".e ." => {
+            open_source(stop, style);
+            Next::Stay
+        }
+        other if other.starts_with(".edit ") || other.starts_with(".e ") => {
+            let path = other.split_once(' ').map_or("", |(_, path)| path.trim());
+            edit_value(program, path, style)
+        }
+        other
+            if other
+                .split(' ')
+                .next()
+                .is_some_and(|c| c == ".where" || c == ".w") =>
+        {
+            let around = match other
+                .split_once(' ')
+                .map(|(_, n)| n.trim().parse::<usize>())
+            {
+                None => (view::BEFORE, view::AFTER),
+                Some(Ok(n)) => (n, n),
+                Some(Err(_)) => {
+                    eprintln!("usage: .where [N]");
+                    return Next::Stay;
+                }
+            };
             // Fresh previews, earlier input may have changed values.
             let current = program.request(&json!({"describe": true}));
             let current = current
                 .as_ref()
                 .and_then(|reply| reply.get("stop"))
                 .unwrap_or(stop);
-            print!("{}", view::render(current, style));
+            print!("{}", view::render(current, style, around));
             Next::Stay
         }
         ".ls" => {
@@ -214,7 +368,7 @@ fn command(program: &mut Program, stop: &Value, line: &str, style: &Style) -> Ne
             eprintln!("unknown command {other}, see .help");
             Next::Stay
         }
-        _ => evaluate(program, line, style),
+        _ => run_input(program, line, style),
     }
 }
 
@@ -284,7 +438,10 @@ pub fn run() -> io::Result<i32> {
         let stop = message.get("stop").cloned().unwrap_or_default();
         // Keys typed while waiting were meant for something else.
         let _ = tcflush(io::stdin(), FlushArg::TCIFLUSH);
-        print!("{}", view::render(&stop, &style));
+        print!(
+            "{}",
+            view::render(&stop, &style, (view::BEFORE, view::AFTER))
+        );
         {
             let mut current = program.borrow_mut();
             current.locals = stop

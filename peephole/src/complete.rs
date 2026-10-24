@@ -118,6 +118,18 @@ pub fn message(mut err: rhai::EvalAltResult) -> String {
     }
 }
 
+pub fn literal(session: &Session, expr: &str) -> Value {
+    let written =
+        lookup(session, expr).and_then(|(value, _)| match value.clone().try_cast::<Node>() {
+            Some(mut node) => crate::literal::literal(node.get().map_err(|err| message(*err))?),
+            None => crate::literal::dynamic(&value),
+        });
+    match written {
+        Ok(text) => json!({"value": text}),
+        Err(err) => json!({"error": err}),
+    }
+}
+
 pub fn path(session: &Session, expr: &str) -> Option<Dynamic> {
     lookup(session, expr).ok().map(|(value, _)| value)
 }

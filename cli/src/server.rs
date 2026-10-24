@@ -278,7 +278,10 @@ fn report(reply: &Value, json: bool) -> i32 {
         return exit_code(status);
     }
     if let Some(stop) = reply.get("stop") {
-        print!("{}", view::render(stop, &Style { color: false }));
+        print!(
+            "{}",
+            view::render(stop, &Style { color: false }, (view::BEFORE, view::AFTER))
+        );
     }
     print!("{}", str_field(reply, "output"));
     let value = str_field(reply, "value").trim_end();

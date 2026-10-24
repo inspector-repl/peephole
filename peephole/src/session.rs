@@ -286,6 +286,8 @@ fn serve(conn: &mut Connection, location: &Location, session: &mut Session) -> s
                 .map_or_else(|| json!({}), |value| json!({"value": value}))
         } else if let Some(text) = request.get("ls").and_then(Value::as_str) {
             complete::ls(session, text)
+        } else if let Some(text) = request.get("literal").and_then(Value::as_str) {
+            complete::literal(session, text)
         } else if request.get("describe").is_some() {
             json!({"stop": session.describe(location)})
         } else if request.get("interrupt").is_some() {
@@ -376,6 +378,61 @@ mod tests {
             error(&mut session, "coupon.len()"),
             "`len` was called on `()`, which is how None reads"
         );
+    }
+
+    #[test]
+    fn writes_values_as_assignable_rhai() {
+        let mut item = Item {
+            name: "tab\there \"q\"".into(),
+            qty: 1,
+            tags: vec!["x".into(), "y".into()],
+            size: (1, 2),
+        };
+        let mut statuses = vec![
+            Status::Pending,
+            Status::Shipped {
+                tracking: "XY".into(),
+            },
+            Status::Split(1, 2),
+        ];
+        let mut price = 2.0_f64;
+        let mut coupon: Option<String> = None;
+        let names: HashMap<String, i64> = HashMap::new();
+        let mut locals = [
+            Local::writable("item", &mut item),
+            Local::writable("statuses", &mut statuses),
+            Local::writable("price", &mut price),
+            Local::writable("coupon", &mut coupon),
+            Local::shared("names", &names),
+        ];
+        let mut session = Session::new(&mut locals);
+        let literal = |session: &Session, path: &str| {
+            let reply = complete::literal(session, path);
+            reply["value"]
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| reply["error"].clone())
+        };
+        assert_eq!(
+            literal(&session, "item").unwrap(),
+            "#{name: \"tab\\there \\\"q\\\"\", qty: 1, tags: [\"x\", \"y\"], size: [1, 2]}"
+        );
+        assert_eq!(
+            literal(&session, "statuses").unwrap(),
+            "[\"Pending\", #{Shipped: #{tracking: \"XY\"}}, #{Split: [1, 2]}]"
+        );
+        assert_eq!(literal(&session, "price").unwrap(), "2.0");
+        assert_eq!(literal(&session, "coupon").unwrap(), "()");
+        assert_eq!(
+            literal(&session, "names").unwrap_err(),
+            "HashMap<String, i64> can't be written as a Rhai value"
+        );
+        for path in ["item", "statuses", "price", "coupon"] {
+            let text = literal(&session, path).unwrap();
+            let reply = session.evaluate(&format!("{path} = {text}"));
+            assert_eq!(reply["error"], false, "{path} = {text}: {reply}");
+            assert_eq!(literal(&session, path).unwrap(), text);
+        }
     }
 
     #[test]
