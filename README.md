@@ -141,6 +141,20 @@ grey hint shows its current value.
 `Option` fields read as their value, or `None` as `()`. Assigning a value
 stores `Some(value)`, assigning `()` stores `None`.
 
+Whole values can be assigned too. Rhai maps become structs, with every
+field given, strings become unit variants, `#{Variant: fields}` other
+variants, and arrays become lists and tuples:
+
+```
+main.rs:42> order.status = "Pending"
+main.rs:42> order.status = #{Shipped: #{tracking: "XY1"}}
+main.rs:42> order.items = order.items.filter(|i| i.qty > 1)
+main.rs:42> order.items[0] = #{name: "fig", qty: 4, price: 1.0}
+```
+
+Lists take the length of what is assigned, the only way to grow or
+shrink them: `items = items.to_array() + [x]` appends.
+
 Besides Rhai's core, logic, string, list and math functions, values from
 the program support `len()`, `keys()`, `variant()`, `type_name()`,
 `to_array()`, `map(|x| …)`, `filter(|x| …)` and `for x in list { … }`.

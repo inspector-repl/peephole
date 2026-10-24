@@ -117,24 +117,37 @@ impl Session {
         })
     }
 
-    /// Writes changed leaf variables back into the program.
-    fn store_leaves(&mut self) -> Result<(), Box<EvalAltResult>> {
+    /// Writes variables assigned as a whole back into the program.
+    fn store_variables(&mut self) -> Result<(), Box<EvalAltResult>> {
         for var in &mut self.variables {
             let Some(current) = self.scope.get_value::<Dynamic>(var.name) else {
                 continue;
             };
-            let program = var.node.get()?;
-            let Some(before) = node::leaf(program) else {
-                continue;
+            let before = match node::leaf(var.node.get()?) {
+                Some(leaf)
+                    if leaf.type_name() == current.type_name()
+                        && leaf.to_string() == current.to_string() =>
+                {
+                    continue;
+                }
+                Some(leaf) => leaf,
+                None if current
+                    .clone()
+                    .try_cast::<Node>()
+                    .is_some_and(|n| n.same(&var.node)) =>
+                {
+                    continue;
+                }
+                None => node::present(var.node.clone()),
             };
-            if before.type_name() == current.type_name()
-                && before.to_string() == current.to_string()
-            {
-                continue;
-            }
             if let Err(err) = node::store(&mut var.node, &current) {
                 self.scope.set_value(var.name, before);
-                return Err(format!("cannot assign to `{}`: {err}", var.name).into());
+                return Err(err);
+            }
+            // A whole struct was copied in, the scope keeps the program's.
+            if node::leaf(var.node.get()?).is_none() {
+                self.scope
+                    .set_value(var.name, node::present(var.node.clone()));
             }
         }
         Ok(())
@@ -155,7 +168,7 @@ impl Session {
         let result = self
             .engine
             .eval_with_scope::<Dynamic>(&mut self.scope, code)
-            .and_then(|value| self.store_leaves().map(|()| value));
+            .and_then(|value| self.store_variables().map(|()| value));
         let output = std::mem::take(&mut *self.output.borrow_mut());
         match result {
             Ok(value) => {
@@ -196,7 +209,10 @@ const RESIZING: &[&str] = &[
 fn not_callable(signature: &str) -> String {
     let name = signature.split(' ').next().unwrap_or_default();
     if RESIZING.contains(&name) {
-        "program lists and maps can't grow or shrink from the REPL".to_owned()
+        format!(
+            "`{name}` only works on Rhai values. Assign a whole list instead, e.g. \
+             items = items.to_array() + [x]"
+        )
     } else if crate::skipped().contains(&name) {
         format!(
             "`{name}` can't be called from the REPL: its arguments \
@@ -264,9 +280,81 @@ mod tests {
     use bevy_reflect::Reflect;
     use std::collections::HashMap;
 
-    #[derive(Reflect)]
+    #[derive(Reflect, Debug, PartialEq)]
     enum Status {
         Pending,
+        Shipped { tracking: String },
+        Split(u32, u32),
+    }
+
+    #[derive(Reflect, Debug, PartialEq)]
+    struct Item {
+        name: String,
+        qty: u32,
+        tags: Vec<String>,
+        size: (u8, u8),
+    }
+
+    #[test]
+    fn replaces_whole_values() {
+        let mut status = Status::Pending;
+        let mut item = Item {
+            name: "a".into(),
+            qty: 1,
+            tags: vec!["x".into()],
+            size: (1, 1),
+        };
+        let mut items = vec![Status::Pending, Status::Split(1, 2)];
+        let mut locals = [
+            Local::writable("status", &mut status),
+            Local::writable("item", &mut item),
+            Local::writable("items", &mut items),
+        ];
+        let mut session = Session::new(&mut locals);
+        let mut ok = |code: &str| {
+            let reply = session.evaluate(code);
+            assert_eq!(reply["error"], false, "{code}: {reply}");
+        };
+        ok(r#"status = #{Shipped: #{tracking: "XY"}}"#);
+        ok(r#"item = #{name: "b", qty: 2, tags: ["y", "z"], size: [3, 4]}"#);
+        ok("items[0] = items[1]");
+        ok("items[1] = \"Pending\"");
+        assert_eq!(
+            error(&mut session, "item = #{name: \"c\"}"),
+            "missing field `qty` for Item"
+        );
+        assert_eq!(
+            error(
+                &mut session,
+                "item = #{name: \"c\", qty: 1, tags: [], size: [1, 1], x: 1}"
+            ),
+            "no field `x` on Item"
+        );
+        assert_eq!(
+            error(&mut session, "status = \"Gone\""),
+            "no variant `Gone` on Status"
+        );
+        assert_eq!(
+            error(&mut session, "status = #{Split: [1]}"),
+            "expected 2 values for Split, got 1"
+        );
+        drop(session);
+        assert_eq!(
+            status,
+            Status::Shipped {
+                tracking: "XY".into()
+            }
+        );
+        assert_eq!(
+            item,
+            Item {
+                name: "b".into(),
+                qty: 2,
+                tags: vec!["y".into(), "z".into()],
+                size: (3, 4)
+            }
+        );
+        assert_eq!(items, [Status::Split(1, 2), Status::Pending]);
     }
 
     #[derive(Reflect)]
@@ -321,7 +409,8 @@ mod tests {
         );
         assert_eq!(
             error(&mut session, "order.items.push(2)"),
-            "program lists and maps can't grow or shrink from the REPL"
+            "`push` only works on Rhai values. Assign a whole list instead, e.g. \
+             items = items.to_array() + [x]"
         );
         assert_eq!(
             error(&mut session, "order.id = 18446744073709551615"),

@@ -86,6 +86,10 @@ impl Node {
         Ok(())
     }
 
+    pub fn same(&self, other: &Node) -> bool {
+        std::ptr::addr_eq(self.ptr, other.ptr)
+    }
+
     pub fn get(&mut self) -> Res<&dyn PartialReflect> {
         self.check()?;
         // SAFETY: valid per `new`, and `check` rules out moves.
@@ -252,6 +256,175 @@ fn convert(value: &Dynamic, ty: TypeId, type_path: &str) -> Res<Box<dyn PartialR
     Err(mismatch(value, type_path).into())
 }
 
+/// Rust values from Rhai ones: maps as structs, strings as unit
+/// variants, `#{Variant: fields}` as other variants, arrays as tuples
+/// and lists.
+fn compose(value: &Dynamic, info: &TypeInfo) -> Res<Box<dyn PartialReflect>> {
+    use bevy_reflect::enums::{DynamicEnum, DynamicVariant};
+    use bevy_reflect::list::DynamicList;
+    use bevy_reflect::tuple_struct::DynamicTupleStruct;
+
+    if value.is::<Node>() {
+        return convert(value, info.type_id(), info.type_path());
+    }
+    if info.type_path().starts_with("core::option::Option<") {
+        return convert_option(info, value);
+    }
+    let name = render::short_type(info.type_path());
+    Ok(match info {
+        TypeInfo::Struct(fields) if value.is_map() => Box::new(named(value, fields.iter(), &name)?),
+        TypeInfo::TupleStruct(fields) if value.is_array() => {
+            let mut out = DynamicTupleStruct::default();
+            for field in unnamed(value, fields.iter(), &name)? {
+                out.insert_boxed(field);
+            }
+            Box::new(out)
+        }
+        TypeInfo::Tuple(fields) if value.is_array() => {
+            Box::new(tuple(unnamed(value, fields.iter(), &name)?))
+        }
+        TypeInfo::List(list) if value.is_array() => {
+            let mut out = DynamicList::default();
+            for item in value.clone().cast::<rhai::Array>() {
+                out.push_box(field(
+                    &item,
+                    list.item_info(),
+                    list.item_ty().id(),
+                    list.item_ty().path(),
+                )?);
+            }
+            Box::new(out)
+        }
+        TypeInfo::Enum(variants) if value.is_string() || value.is_map() => {
+            let (variant, payload) = if value.is_string() {
+                (value.to_string(), Dynamic::UNIT)
+            } else {
+                let mut entries = value.clone().cast::<rhai::Map>().into_iter();
+                match (entries.next(), entries.next()) {
+                    (Some((key, payload)), None) => (key.to_string(), payload),
+                    _ => return Err(format!("expected #{{Variant: fields}} for {name}").into()),
+                }
+            };
+            let built = match variants
+                .variant(&variant)
+                .ok_or_else(|| format!("no variant `{variant}` on {name}"))?
+            {
+                bevy_reflect::enums::VariantInfo::Unit(_) => DynamicVariant::Unit,
+                bevy_reflect::enums::VariantInfo::Struct(fields) => {
+                    DynamicVariant::Struct(named(&payload, fields.iter(), &variant)?)
+                }
+                bevy_reflect::enums::VariantInfo::Tuple(fields) => {
+                    DynamicVariant::Tuple(tuple(unnamed(&payload, fields.iter(), &variant)?))
+                }
+            };
+            Box::new(DynamicEnum::new(variant, built))
+        }
+        _ => convert(value, info.type_id(), info.type_path())?,
+    })
+}
+
+fn field(
+    value: &Dynamic,
+    info: Option<&TypeInfo>,
+    ty: TypeId,
+    type_path: &str,
+) -> Res<Box<dyn PartialReflect>> {
+    match info {
+        Some(info) => compose(value, info),
+        None => convert(value, ty, type_path),
+    }
+}
+
+fn named<'f>(
+    value: &Dynamic,
+    fields: impl Iterator<Item = &'f bevy_reflect::NamedField>,
+    name: &str,
+) -> Res<bevy_reflect::structs::DynamicStruct> {
+    let mut map = value
+        .clone()
+        .try_cast::<rhai::Map>()
+        .ok_or_else(|| format!("expected a map like #{{field: value}} for {name}"))?;
+    let mut out = bevy_reflect::structs::DynamicStruct::default();
+    for info in fields {
+        let given = map
+            .remove(info.name())
+            .ok_or_else(|| format!("missing field `{}` for {name}", info.name()))?;
+        out.insert_boxed(
+            info.name(),
+            field(&given, info.type_info(), info.type_id(), info.type_path())?,
+        );
+    }
+    if let Some(extra) = map.keys().next() {
+        return Err(format!("no field `{extra}` on {name}").into());
+    }
+    Ok(out)
+}
+
+/// An array, or a single value for one field.
+fn unnamed<'f>(
+    value: &Dynamic,
+    fields: impl ExactSizeIterator<Item = &'f bevy_reflect::UnnamedField>,
+    name: &str,
+) -> Res<Vec<Box<dyn PartialReflect>>> {
+    let given = if value.is_array() {
+        value.clone().cast::<rhai::Array>()
+    } else {
+        vec![value.clone()]
+    };
+    if given.len() != fields.len() {
+        return Err(format!(
+            "expected {} values for {name}, got {}",
+            fields.len(),
+            given.len()
+        )
+        .into());
+    }
+    given
+        .iter()
+        .zip(fields)
+        .map(|(value, info)| field(value, info.type_info(), info.type_id(), info.type_path()))
+        .collect()
+}
+
+fn tuple(fields: Vec<Box<dyn PartialReflect>>) -> bevy_reflect::tuple::DynamicTuple {
+    let mut out = bevy_reflect::tuple::DynamicTuple::default();
+    for field in fields {
+        out.insert_boxed(field);
+    }
+    out
+}
+
+/// Like `try_apply`, but lists take the length of `source`.
+fn assign(target: &mut dyn PartialReflect, source: &dyn PartialReflect) -> Res<()> {
+    if let ReflectRef::List(source) = source.reflect_ref()
+        && let ReflectMut::List(target) = target.reflect_mut()
+    {
+        while target.len() > source.len() {
+            target.pop();
+        }
+        for (at, item) in source.iter().enumerate() {
+            match target.get_mut(at) {
+                Some(existing) => assign(existing, item)?,
+                None => target.push(item.to_dynamic().map_err(|err| err.to_string())?),
+            }
+        }
+        return Ok(());
+    }
+    if let ReflectRef::Struct(source) = source.reflect_ref()
+        && let ReflectMut::Struct(target) = target.reflect_mut()
+    {
+        for (name, item) in source.iter_fields() {
+            if let Some(existing) = target.field_mut(name) {
+                assign(existing, item)?;
+            }
+        }
+        return Ok(());
+    }
+    target
+        .try_apply(source)
+        .map_err(|err| err.to_string().into())
+}
+
 /// `()` as `None`, anything else as `Some(value)`.
 fn convert_option(info: &TypeInfo, value: &Dynamic) -> Res<Box<dyn PartialReflect>> {
     use bevy_reflect::enums::{DynamicEnum, DynamicVariant};
@@ -267,7 +440,12 @@ fn convert_option(info: &TypeInfo, value: &Dynamic) -> Res<Box<dyn PartialReflec
         .and_then(|variant| variant.field_at(0))
         .ok_or("unknown Option type")?;
     let mut tuple = DynamicTuple::default();
-    tuple.insert_boxed(convert(value, inner.type_id(), inner.type_path())?);
+    tuple.insert_boxed(field(
+        value,
+        inner.type_info(),
+        inner.type_id(),
+        inner.type_path(),
+    )?);
     Ok(Box::new(DynamicEnum::new(
         "Some",
         DynamicVariant::Tuple(tuple),
@@ -286,16 +464,10 @@ pub fn store(node: &mut Node, value: &Dynamic) -> Res<()> {
     let info = target
         .get_represented_type_info()
         .ok_or_else(|| mismatch(value, target.reflect_short_type_path()))?;
-    let new = if is_option(target) && !value.is::<Node>() {
-        convert_option(info, value)?
-    } else {
-        convert(value, info.type_id(), info.type_path())?
-    };
+    let new = compose(value, info)?;
     // Leaves own no memory that other nodes could point into.
     let moves = leaf(target).is_none();
-    target
-        .try_apply(new.as_ref())
-        .map_err(|err| err.to_string())?;
+    assign(target, new.as_ref())?;
     if moves {
         shared.generation.set(shared.generation.get() + 1);
     }
