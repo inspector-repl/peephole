@@ -18,7 +18,7 @@ mod render;
 mod session;
 
 pub use bevy_reflect::{self, Reflect};
-pub use peephole_macros::scope;
+pub use peephole_macros::{methods, scope};
 
 use bevy_reflect::func::{DynamicFunction, IntoFunction};
 use std::sync::Mutex;
@@ -218,6 +218,79 @@ macro_rules! __locals {
             $($($rest)*)?
         )
     };
+}
+
+#[doc(hidden)]
+pub mod __private {
+    use bevy_reflect::func::{DynamicFunction, IntoFunction};
+    pub use inventory;
+
+    /// A method registered by `#[peephole::methods]`.
+    pub struct Method {
+        pub function: fn() -> Option<DynamicFunction<'static>>,
+        pub name: &'static str,
+    }
+
+    inventory::collect!(Method);
+
+    // Autoref dispatch again: methods bevy can't call, e.g. with `&str`
+    // arguments, fall through to `Skip` instead of failing the build.
+    pub struct Callable<F>(pub F);
+
+    pub trait Convert<M> {
+        fn function(&self) -> Option<DynamicFunction<'static>>;
+    }
+
+    impl<M, F: IntoFunction<'static, M> + Clone> Convert<M> for &Callable<F> {
+        fn function(&self) -> Option<DynamicFunction<'static>> {
+            Some(self.0.clone().into_function())
+        }
+    }
+
+    pub trait Skip {
+        fn function(&self) -> Option<DynamicFunction<'static>>;
+    }
+
+    impl<F> Skip for Callable<F> {
+        fn function(&self) -> Option<DynamicFunction<'static>> {
+            None
+        }
+    }
+}
+
+/// Functions from `expose` first, so they win over `#[methods]`.
+pub(crate) fn functions() -> Vec<(String, DynamicFunction<'static>)> {
+    let mut out = FUNCTIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    out.extend(
+        inventory::iter::<__private::Method>
+            .into_iter()
+            .filter_map(|method| Some((method.name.to_owned(), (method.function)()?))),
+    );
+    out
+}
+
+/// Methods `#[methods]` found but `bevy_reflect` can't call.
+pub(crate) fn skipped() -> Vec<&'static str> {
+    inventory::iter::<__private::Method>
+        .into_iter()
+        .filter(|method| (method.function)().is_none())
+        .map(|method| method.name)
+        .collect()
+}
+
+/// The type a function is a method of: its first parameter's, without `&`.
+pub(crate) fn receiver(function: &DynamicFunction<'_>) -> &'static str {
+    function
+        .info()
+        .base()
+        .args()
+        .first()
+        .map_or("", |arg| arg.type_path())
+        .trim_start_matches('&')
+        .trim_start_matches("mut ")
 }
 
 pub(crate) static FUNCTIONS: Mutex<Vec<(String, DynamicFunction<'static>)>> =

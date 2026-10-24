@@ -27,6 +27,77 @@ pub fn scope(
         .into()
 }
 
+/// Makes the methods of an `impl` block callable from the REPL, e.g.
+/// `order.total()`. Methods `bevy_reflect` can't call are left out.
+#[proc_macro_attribute]
+pub fn methods(
+    attr: proc_macro::TokenStream,
+    item: proc_macro::TokenStream,
+) -> proc_macro::TokenStream {
+    if !attr.is_empty() {
+        return syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "#[methods] takes no arguments",
+        )
+        .into_compile_error()
+        .into();
+    }
+    register_methods(item.into())
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+fn register_methods(item: TokenStream) -> syn::Result<TokenStream> {
+    let block: syn::ItemImpl = syn::parse2(item)?;
+    // A generic impl has no single function to register.
+    if block.generics.type_params().next().is_some()
+        || block.generics.const_params().next().is_some()
+    {
+        return Ok(block.into_token_stream());
+    }
+    let self_ty = &block.self_ty;
+    let owner = if let Some((_, path, _)) = &block.trait_ {
+        quote!(<#self_ty as #path>)
+    } else {
+        quote!(<#self_ty>)
+    };
+    let entries = block.items.iter().filter_map(|item| {
+        let syn::ImplItem::Fn(method) = item else {
+            return None;
+        };
+        let sig = &method.sig;
+        let plain = sig.receiver().is_some()
+            && sig.asyncness.is_none()
+            && sig.unsafety.is_none()
+            && sig.generics.type_params().next().is_none()
+            && sig.generics.const_params().next().is_none();
+        if !plain {
+            return None;
+        }
+        let ident = &sig.ident;
+        let name = ident.to_string();
+        Some(quote! {
+            ::peephole::__private::inventory::submit! {
+                ::peephole::__private::Method {
+                    name: #name,
+                    function: || {
+                        #[allow(unused_imports)]
+                        use ::peephole::__private::{Convert as _, Skip as _};
+                        (&&::peephole::__private::Callable(#owner::#ident)).function()
+                    },
+                }
+            }
+        })
+    });
+    let entries: Vec<TokenStream> = entries.collect();
+    Ok(quote! {
+        #block
+        const _: () = {
+            #(#entries)*
+        };
+    })
+}
+
 fn expand(item: TokenStream) -> syn::Result<TokenStream> {
     let mut function: ItemFn = syn::parse2(item)?;
     let mut scopes = Scopes::default();

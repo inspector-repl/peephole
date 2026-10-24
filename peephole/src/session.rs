@@ -170,10 +170,18 @@ impl Session {
                         if signature.contains("(value") =>
                     {
                         let name = signature.split(' ').next().unwrap_or_default();
-                        format!(
-                            "{err}\nProgram methods are only callable after \
-                             peephole::expose(\"{name}\", Type::{name})."
-                        )
+                        if crate::skipped().contains(&name) {
+                            format!(
+                                "{err}\n`{name}` can't be called from the REPL: its arguments \
+                                 must be owned and implement Reflect, e.g. String, not &str."
+                            )
+                        } else {
+                            format!(
+                                "{err}\nProgram methods are callable after \
+                                 #[peephole::methods] on their impl block, or \
+                                 peephole::expose(\"{name}\", Type::{name})."
+                            )
+                        }
                     }
                     other => other.to_string(),
                 };

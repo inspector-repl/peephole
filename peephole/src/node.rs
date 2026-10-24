@@ -1,6 +1,7 @@
 //! Live views into program memory for Rhai scripts.
 
 use crate::render;
+use bevy_reflect::func::DynamicFunction;
 use bevy_reflect::{PartialReflect, ReflectMut, ReflectRef, TypeInfo};
 use rhai::{Dynamic, Engine, EvalAltResult, FnPtr, NativeCallContext};
 use std::any::TypeId;
@@ -511,10 +512,20 @@ impl IntoIterator for Node {
     }
 }
 
-fn call(
-    function: &bevy_reflect::func::DynamicFunction<'static>,
+fn pick<'f>(
+    candidates: &'f [DynamicFunction<'static>],
     args: &[&mut Dynamic],
-) -> Res<Dynamic> {
+) -> &'f DynamicFunction<'static> {
+    let first = args
+        .first()
+        .and_then(|arg| (**arg).clone().try_cast::<Node>())
+        .and_then(|mut node| Some(node.get().ok()?.reflect_type_path().to_owned()));
+    first
+        .and_then(|ty| candidates.iter().find(|f| crate::receiver(f) == ty))
+        .unwrap_or(&candidates[0])
+}
+
+fn call(function: &DynamicFunction<'static>, args: &[&mut Dynamic]) -> Res<Dynamic> {
     use bevy_reflect::func::args::Ownership;
     use bevy_reflect::func::{ArgList, Return};
     let signature = function.info().base();
@@ -634,16 +645,23 @@ pub fn register(engine: &mut Engine) {
             Ok(render::flat(node.get()?))
         });
 
-    let functions = crate::FUNCTIONS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    for (name, function) in functions.iter() {
-        let function = function.clone();
-        let arity = function.info().base().arg_count();
+    // Methods of different types may share a name, calls pick by the
+    // type of the first argument.
+    let mut groups: Vec<((String, usize), Vec<DynamicFunction<'static>>)> = Vec::new();
+    for (name, function) in crate::functions() {
+        let key = (name, function.info().base().arg_count());
+        match groups.iter_mut().find(|(known, _)| *known == key) {
+            Some((_, candidates)) => candidates.push(function),
+            None => groups.push((key, vec![function])),
+        }
+    }
+    for ((name, arity), candidates) in groups {
         engine.register_raw_fn(
-            name.as_str(),
+            name,
             vec![TypeId::of::<Dynamic>(); arity],
-            move |_: NativeCallContext, args: &mut [&mut Dynamic]| call(&function, args),
+            move |_: NativeCallContext, args: &mut [&mut Dynamic]| {
+                call(pick(&candidates, args), args)
+            },
         );
     }
 }

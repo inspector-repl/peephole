@@ -13,6 +13,7 @@ serde_json.workspace = true
 bevy_reflect = { version = "0.20", default-features = false, features = ["std", "functions"] }
 # Only the core, logic, string, list and math packages are loaded.
 rhai = { version = "1", default-features = false, features = ["std", "only_i64", "no_time", "no_module", "no_custom_syntax"] }
+inventory = "0.3.25"
 
 [lints]
 workspace = true

@@ -100,14 +100,29 @@ Fields of foreign types that don't implement `Reflect` need
 [`reflect_remote`](https://docs.rs/bevy_reflect/latest/bevy_reflect/attr.reflect_remote.html)
 can mirror them instead.
 
-Functions and methods become callable after `expose`:
+Methods become callable with `#[peephole::methods]` on their `impl`
+block:
+
+```rust
+#[peephole::methods]
+impl Order {
+    fn total(&self) -> f64 { … }
+}
+```
+
+`order.total()` then works in the REPL. Methods of different types may
+share a name, the call picks by the type of the value. Arguments must be
+owned and implement `Reflect`, so a method taking `&str` is left out,
+and calling it explains why. Generic methods and `impl` blocks are left
+out as well.
+
+Other functions, or methods of types you can't annotate, become callable
+with `expose`. A function whose first parameter is a reflected type is
+also callable as a method on it:
 
 ```rust
 peephole::expose("total", Order::total);
 ```
-
-`order.total()` then works in the REPL, since the first parameter is an
-`Order`.
 
 ## The REPL
 

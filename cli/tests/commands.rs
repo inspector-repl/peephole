@@ -142,6 +142,16 @@ fn handles_read_only_values_options_and_methods() {
     assert_eq!(eval(&state, "names.bob"), (Some(0), "2".into()));
 
     // Methods on properties of read-only values write the property back.
+    assert_eq!(
+        eval(&state, "order.items[1].total()"),
+        (Some(0), "1.5".into())
+    );
+    let (code, shown) = eval(&state, r#"order.tagged("x")"#);
+    assert_eq!(code, Some(1));
+    assert!(
+        shown.contains("`tagged` can't be called from the REPL"),
+        "{shown}"
+    );
     let shipped = r#"history.filter(|e| e.status.variant() == "Shipped").len()"#;
     assert_eq!(eval(&state, shipped), (Some(0), "1".into()));
 

@@ -30,9 +30,22 @@ pub struct Order {
     secret: String,
 }
 
+#[peephole::methods]
+impl Item {
+    fn total(&self) -> f64 {
+        f64::from(self.qty) * self.price
+    }
+}
+
+#[peephole::methods]
 impl Order {
     fn total(&self) -> f64 {
-        self.items.iter().map(|i| f64::from(i.qty) * i.price).sum()
+        self.items.iter().map(Item::total).sum()
+    }
+
+    /// Not callable from the REPL, `&str` arguments aren't supported.
+    fn tagged(&self, tag: &str) -> String {
+        format!("{tag}{}", self.id)
     }
 }
 
@@ -53,7 +66,6 @@ fn checkout(order: &mut Order, attempts: &mut u32) {
 }
 
 fn main() {
-    peephole::expose("total", Order::total);
     let mut order = Order {
         id: 7,
         coupon: None,
@@ -86,4 +98,5 @@ fn main() {
         order.total(),
         order.coupon
     );
+    assert_eq!(order.tagged("#"), "#7");
 }

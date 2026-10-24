@@ -221,27 +221,9 @@ fn trailing_expr(line: &str) -> &str {
 }
 
 fn exposed() -> Vec<(String, String)> {
-    let functions = crate::FUNCTIONS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    functions
+    crate::functions()
         .iter()
-        .map(|(name, function)| {
-            // Paths of reference parameters start with `&` or `&mut `.
-            let first = function
-                .info()
-                .base()
-                .args()
-                .first()
-                .map_or("", |arg| arg.type_path());
-            (
-                name.clone(),
-                first
-                    .trim_start_matches('&')
-                    .trim_start_matches("mut ")
-                    .to_owned(),
-            )
-        })
+        .map(|(name, function)| (name.clone(), crate::receiver(function).to_owned()))
         .collect()
 }
 
