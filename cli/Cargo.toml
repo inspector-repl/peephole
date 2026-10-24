@@ -1,0 +1,23 @@
+[package]
+name = "peephole-cli"
+description = "REPL for programs stopped at peephole::inspect!"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "peephole"
+path = "src/main.rs"
+
+[dependencies]
+peephole-protocol.workspace = true
+serde_json.workspace = true
+libc.workspace = true
+rustyline = { version = "17", default-features = false, features = ["with-file-history"] }
+
+[dev-dependencies]
+peephole-protocol.workspace = true
+
+[lints]
+workspace = true

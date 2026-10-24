@@ -1,0 +1,14 @@
+[package]
+name = "peephole-protocol"
+description = "Wire protocol between programs stopped at peephole::inspect! and the peephole client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde_json.workspace = true
+libc.workspace = true
+
+[lints]
+workspace = true
