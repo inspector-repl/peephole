@@ -147,6 +147,10 @@ impl Session {
             (check && readable(fd, Some(Duration::ZERO)).unwrap_or(true))
                 .then(|| "interrupted".into())
         });
+        self.evaluate(code)
+    }
+
+    fn evaluate(&mut self, code: &str) -> Value {
         self.output.borrow_mut().clear();
         let result = self
             .engine
@@ -164,30 +168,46 @@ impl Session {
                 json!({"value": shown, "output": output, "error": false})
             }
             Err(err) => {
-                let text = match *err {
+                let line = err.position().line().filter(|_| code.contains('\n'));
+                let mut text = match *err {
                     EvalAltResult::ErrorTerminated(..) => "interrupted".to_owned(),
                     EvalAltResult::ErrorFunctionNotFound(ref signature, _)
                         if signature.contains("(value") =>
                     {
-                        let name = signature.split(' ').next().unwrap_or_default();
-                        if crate::skipped().contains(&name) {
-                            format!(
-                                "{err}\n`{name}` can't be called from the REPL: its arguments \
-                                 must be owned and implement Reflect, e.g. String, not &str."
-                            )
-                        } else {
-                            format!(
-                                "{err}\nProgram methods are callable after \
-                                 #[peephole::methods] on their impl block, or \
-                                 peephole::expose(\"{name}\", Type::{name})."
-                            )
-                        }
+                        not_callable(signature)
                     }
-                    other => other.to_string(),
+                    _ => complete::message(*err),
                 };
+                if let Some(line) = line {
+                    write!(text, " (line {line})").unwrap_or_default();
+                }
                 json!({"value": text, "output": output, "error": true})
             }
         }
+    }
+}
+
+/// Rhai's own list and map methods only work on Rhai values.
+const RESIZING: &[&str] = &[
+    "push", "pop", "shift", "insert", "remove", "clear", "append", "truncate", "extend", "retain",
+    "drain", "splice", "dedup", "chop",
+];
+
+fn not_callable(signature: &str) -> String {
+    let name = signature.split(' ').next().unwrap_or_default();
+    if RESIZING.contains(&name) {
+        "program lists and maps can't grow or shrink from the REPL".to_owned()
+    } else if crate::skipped().contains(&name) {
+        format!(
+            "`{name}` can't be called from the REPL: its arguments \
+             must be owned and implement Reflect, e.g. String, not &str."
+        )
+    } else {
+        format!(
+            "no method `{name}`. Program methods are callable after \
+             #[peephole::methods] on their impl block, or \
+             peephole::expose(\"{name}\", Type::{name})."
+        )
     }
 }
 
@@ -236,4 +256,80 @@ pub fn run(location: &Location, locals: &mut [Local<'_>]) {
     let mut session = Session::new(locals);
     // A client that goes away just lets the program continue.
     let _ = serve(&mut conn, location, &mut session);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy_reflect::Reflect;
+    use std::collections::HashMap;
+
+    #[derive(Reflect)]
+    enum Status {
+        Pending,
+    }
+
+    #[derive(Reflect)]
+    struct Order {
+        id: u64,
+        name: String,
+        items: Vec<u32>,
+        status: Status,
+    }
+
+    fn error(session: &mut Session, code: &str) -> String {
+        let reply = session.evaluate(code);
+        assert_eq!(reply["error"], true, "{code} succeeded: {reply}");
+        reply["value"].as_str().unwrap().to_owned()
+    }
+
+    #[test]
+    fn explains_errors_plainly() {
+        let mut order = Order {
+            id: 7,
+            name: "a".into(),
+            items: vec![1],
+            status: Status::Pending,
+        };
+        let names: HashMap<String, i64> = HashMap::from([("bob".into(), 1)]);
+        let mut attempts = 1_u32;
+        let mut locals = [
+            Local::writable("order", &mut order),
+            Local::shared("names", &names),
+            Local::writable("attempts", &mut attempts),
+        ];
+        let mut session = Session::new(&mut locals);
+
+        assert_eq!(complete::ls(&session, "attempts")["type"], "u32");
+        assert_eq!(complete::ls(&session, "order.name")["type"], "String");
+        assert_eq!(
+            complete::ls(&session, "names")["type"],
+            "HashMap<String, i64>"
+        );
+
+        assert_eq!(
+            error(&mut session, "order.status = 1"),
+            "cannot assign i64 to Status"
+        );
+        assert_eq!(
+            error(&mut session, r#"names["carol"]"#),
+            "no key \"carol\" in HashMap<String, i64>"
+        );
+        assert!(
+            error(&mut session, "names.bob = 2").contains("`let mut`"),
+            "read-only hint"
+        );
+        assert_eq!(
+            error(&mut session, "order.items.push(2)"),
+            "program lists and maps can't grow or shrink from the REPL"
+        );
+        assert_eq!(
+            error(&mut session, "order.id = 18446744073709551615"),
+            "1.8446744073709552e19 is too large, the REPL's integers are i64"
+        );
+        assert_eq!(
+            error(&mut session, "let x = 1;\norder.nope"),
+            "no field `nope` on Order. Did you mean `name`? (line 2)"
+        );
+    }
 }

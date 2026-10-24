@@ -28,7 +28,8 @@ pub fn short_type(path: &str) -> String {
             out.push(c);
         }
     }
-    out + segment.as_str()
+    // The default hasher is noise, and `type_name` leaves it out anyway.
+    (out + segment.as_str()).replace(", RandomState>", ">")
 }
 
 enum Doc {

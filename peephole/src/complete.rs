@@ -80,27 +80,46 @@ pub fn is_path(code: &str) -> bool {
 }
 
 /// Looks up a path without running code, so it has no side effects.
-fn lookup(session: &Session, expr: &str) -> Result<Dynamic, String> {
+/// Also returns the Rust type, which leaves lose as Rhai values.
+fn lookup(session: &Session, expr: &str) -> Result<(Dynamic, String), String> {
     let (root, steps) =
         parse(expr.trim()).ok_or("expected a variable or a path like order.items[0]")?;
     let mut value = session
         .scope
         .get_value::<Dynamic>(root)
         .ok_or_else(|| format!("no variable `{root}`"))?;
+    let mut ty = session
+        .variables
+        .iter()
+        .find(|var| var.name == root)
+        .map_or_else(|| value.type_name().to_owned(), |var| var.type_name.clone());
     for step in steps {
         let mut node = value
             .try_cast::<Node>()
             .ok_or("only program values have fields")?;
-        value = node::step(&mut node, &step).map_err(|err| match *err {
-            rhai::EvalAltResult::ErrorRuntime(message, _) => message.to_string(),
-            other => other.to_string(),
-        })?;
+        let mut child = node::child(&mut node, &step).map_err(|err| message(*err))?;
+        ty = render::short_type(
+            child
+                .get()
+                .map_err(|err| message(*err))?
+                .reflect_type_path(),
+        );
+        value = node::present(child);
     }
-    Ok(value)
+    Ok((value, ty))
+}
+
+/// An error without Rhai's "Runtime error:" prefix and position.
+pub fn message(mut err: rhai::EvalAltResult) -> String {
+    let _ = err.take_position();
+    match err {
+        rhai::EvalAltResult::ErrorRuntime(message, _) => message.to_string(),
+        other => other.to_string(),
+    }
 }
 
 pub fn path(session: &Session, expr: &str) -> Option<Dynamic> {
-    lookup(session, expr).ok()
+    lookup(session, expr).ok().map(|(value, _)| value)
 }
 
 /// Everything about a value at once: its type, fields with previews, and
@@ -132,12 +151,12 @@ pub fn ls(session: &Session, expr: &str) -> Value {
             .collect();
         return json!({"fields": fields, "functions": functions});
     }
-    let value = match lookup(session, expr) {
-        Ok(value) => value,
+    let (value, ty) = match lookup(session, expr) {
+        Ok(found) => found,
         Err(err) => return json!({"error": err}),
     };
     let Some(mut node) = value.clone().try_cast::<Node>() else {
-        return json!({"type": value.type_name(), "value": render::preview(&value, LS_WIDTH)});
+        return json!({"type": ty, "value": render::preview(&value, LS_WIDTH)});
     };
     let Ok(reflected) = node.get() else {
         return json!({"error": "stale reference"});

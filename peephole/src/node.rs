@@ -95,7 +95,7 @@ impl Node {
     pub fn get_mut(&mut self) -> Res<&mut dyn PartialReflect> {
         self.check()?;
         if !self.writable {
-            return Err("read-only: pass the variable to inspect! as `mut` to change it".into());
+            return Err("read-only: declare it `let mut`, or pass it to inspect! as `mut`".into());
         }
         // SAFETY: as in `get`, and the pointer came from a `&mut`.
         Ok(unsafe { &mut *self.ptr })
@@ -174,7 +174,21 @@ fn keep(value: Box<dyn PartialReflect>, shared: &Rc<Shared>) -> Dynamic {
 }
 
 fn mismatch(value: &Dynamic, target: &str) -> String {
-    format!("cannot assign {} to {target}", value.type_name())
+    format!(
+        "cannot assign {} to {}",
+        value.type_name(),
+        render::short_type(target)
+    )
+}
+
+/// Integer literals beyond `i64` parse as floats.
+fn int_mismatch(value: &Dynamic, target: &str) -> String {
+    match value.as_float() {
+        Ok(float) if float.fract() == 0.0 => {
+            format!("{value} is too large, the REPL's integers are i64")
+        }
+        _ => mismatch(value, target),
+    }
 }
 
 /// Exact for the `i32` range only, so nothing rounds.
@@ -193,7 +207,7 @@ fn float(value: &Dynamic, target: &str) -> Res<f64> {
 macro_rules! convert_int {
     ($value:expr, $ty:expr; $($t:ty),*) => {
         $(if $ty == TypeId::of::<$t>() {
-            let int = $value.as_int().map_err(|_| mismatch($value, stringify!($t)))?;
+            let int = $value.as_int().map_err(|_| int_mismatch($value, stringify!($t)))?;
             let x = <$t>::try_from(int).map_err(|_| format!("{int} is out of range for {}", stringify!($t)))?;
             return Ok(Box::new(x));
         })*
@@ -348,6 +362,12 @@ pub enum Step<'s> {
 }
 
 fn no_member(value: &dyn PartialReflect, name: &str) -> String {
+    if let ReflectRef::Map(_) = value.reflect_ref() {
+        return format!(
+            "no key {name:?} in {}",
+            render::short_type(value.reflect_type_path())
+        );
+    }
     format!(
         "no field `{name}` on {}{}",
         value.reflect_short_type_path(),
@@ -429,7 +449,7 @@ fn locate_mut<'a>(
     found.ok_or_else(|| "not found".into())
 }
 
-fn child(node: &mut Node, step: &Step<'_>) -> Res<Node> {
+pub fn child(node: &mut Node, step: &Step<'_>) -> Res<Node> {
     let ptr = if node.writable {
         std::ptr::from_mut(locate_mut(node.get_mut()?, step)?)
     } else {
