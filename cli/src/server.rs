@@ -5,6 +5,8 @@
 //! wait in the listen backlog.
 
 use crate::view::{self, Style, str_field};
+use nix::sys::signal::{Signal, kill};
+use nix::unistd::Pid;
 use peephole_protocol::{Connection, listen, listening, readable, socket_path, state_dir};
 use serde_json::{Value, json};
 use std::io::{self, Read};
@@ -235,10 +237,7 @@ fn start_server() -> io::Result<()> {
         .stderr(log);
     // SAFETY: setsid is async-signal-safe.
     unsafe {
-        command.pre_exec(|| {
-            libc::setsid();
-            Ok(())
-        });
+        command.pre_exec(|| Ok(nix::unistd::setsid().map(drop)?));
     }
     command.spawn()?;
     Ok(())
@@ -349,12 +348,11 @@ fn stop() -> io::Result<i32> {
     conn.send(&json!({"shutdown": true}))?;
     if !(conn.wait(Some(START_LIMIT))? && conn.receive()?.is_some()) {
         // Busy in a native call. A live control socket means the pid is current.
-        let pid: i32 = std::fs::read_to_string(pid_path())?
+        let pid = std::fs::read_to_string(pid_path())?
             .trim()
             .parse()
             .map_err(io::Error::other)?;
-        // SAFETY: plain syscall.
-        unsafe { libc::kill(pid, libc::SIGTERM) };
+        let _ = kill(Pid::from_raw(pid), Signal::SIGTERM);
     }
     let deadline = Instant::now() + START_LIMIT;
     while running() {

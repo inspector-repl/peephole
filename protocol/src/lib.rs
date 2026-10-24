@@ -5,9 +5,11 @@
 //! `inspect!`, sends `{"stop": …}` and then answers requests until it gets
 //! `{"continue": true}` or the connection closes.
 
+use nix::errno::Errno;
+use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use serde_json::Value;
 use std::io::{self, BufRead, BufReader, Write};
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -66,21 +68,16 @@ pub fn listen(path: &Path) -> io::Result<UnixListener> {
 
 /// Waits until `fd` is readable or closed. `None` waits forever.
 pub fn readable(fd: RawFd, timeout: Option<Duration>) -> io::Result<bool> {
-    let millis = timeout.map_or(-1, |t| i32::try_from(t.as_millis()).unwrap_or(i32::MAX));
-    let mut poll = libc::pollfd {
-        fd,
-        events: libc::POLLIN,
-        revents: 0,
-    };
+    let timeout = timeout.map_or(PollTimeout::NONE, |t| {
+        PollTimeout::try_from(t).unwrap_or(PollTimeout::MAX)
+    });
+    // SAFETY: callers pass a descriptor they keep open for the call.
+    let fd = unsafe { BorrowedFd::borrow_raw(fd) };
     loop {
-        // SAFETY: `poll` points to one valid pollfd.
-        let ready = unsafe { libc::poll(&raw mut poll, 1, millis) };
-        if ready >= 0 {
-            return Ok(ready > 0);
-        }
-        let err = io::Error::last_os_error();
-        if err.kind() != io::ErrorKind::Interrupted {
-            return Err(err);
+        match poll(&mut [PollFd::new(fd, PollFlags::POLLIN)], timeout) {
+            Ok(ready) => return Ok(ready > 0),
+            Err(Errno::EINTR) => {}
+            Err(err) => return Err(err.into()),
         }
     }
 }

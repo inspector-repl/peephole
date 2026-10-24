@@ -1,10 +1,11 @@
 //! Ctrl-C outside the line editor stops the running input, not the client.
 
+use nix::sys::signal::{SigHandler, Signal, signal};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 static PENDING: AtomicBool = AtomicBool::new(false);
 
-extern "C" fn on_sigint(_: libc::c_int) {
+extern "C" fn on_sigint(_: std::ffi::c_int) {
     PENDING.store(true, Ordering::SeqCst);
 }
 
@@ -13,9 +14,7 @@ extern "C" fn on_sigint(_: libc::c_int) {
 pub fn install() {
     PENDING.store(false, Ordering::SeqCst);
     // SAFETY: the handler only stores to an atomic.
-    unsafe {
-        libc::signal(libc::SIGINT, on_sigint as *const () as libc::sighandler_t);
-    }
+    let _ = unsafe { signal(Signal::SIGINT, SigHandler::Handler(on_sigint)) };
 }
 
 /// Whether Ctrl-C was pressed since the last call.

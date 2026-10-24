@@ -4,6 +4,7 @@ use crate::highlight;
 use crate::interrupt;
 use crate::server;
 use crate::view::{self, Style, str_field};
+use nix::sys::termios::{FlushArg, tcflush};
 use peephole_protocol::{Connection, listen, listening, readable, socket_path, state_dir};
 use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
@@ -266,8 +267,7 @@ pub fn run() -> io::Result<i32> {
         };
         let stop = message.get("stop").cloned().unwrap_or_default();
         // Keys typed while waiting were meant for something else.
-        // SAFETY: plain syscall on stdin.
-        unsafe { libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH) };
+        let _ = tcflush(io::stdin(), FlushArg::TCIFLUSH);
         print!("{}", view::render(&stop, &style));
         {
             let mut current = program.borrow_mut();
