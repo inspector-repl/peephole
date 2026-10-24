@@ -130,7 +130,6 @@ impl Validator for Ui {
 
 impl Helper for Ui {}
 
-/// Removes the socket when the REPL exits.
 struct Bound(std::path::PathBuf);
 
 impl Drop for Bound {

@@ -36,7 +36,6 @@ pub fn socket_path() -> PathBuf {
         .map_or_else(|| state_dir().join("sock"), PathBuf::from)
 }
 
-/// Whether something accepts connections on `path`.
 #[must_use]
 pub fn listening(path: &Path) -> bool {
     UnixStream::connect(path).is_ok()
@@ -86,7 +85,6 @@ pub fn readable(fd: RawFd, timeout: Option<Duration>) -> io::Result<bool> {
     }
 }
 
-/// One end of a NUL-delimited JSON stream.
 pub struct Connection {
     reader: BufReader<UnixStream>,
     writer: UnixStream,

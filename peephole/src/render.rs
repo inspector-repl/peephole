@@ -56,9 +56,10 @@ fn quoted(value: &Dynamic) -> String {
 fn group<'a>(
     open: String,
     close: &'static str,
-    items: impl ExactSizeIterator<Item = (Option<String>, &'a dyn PartialReflect)>,
+    items: impl IntoIterator<Item = (Option<String>, &'a dyn PartialReflect)>,
     depth: usize,
 ) -> Doc {
+    let items: Vec<_> = items.into_iter().collect();
     let len = items.len();
     if depth >= MAX_DEPTH && len > 0 {
         return Doc::Leaf(format!("{open}…{close}"));
@@ -67,6 +68,7 @@ fn group<'a>(
         open,
         close,
         items: items
+            .into_iter()
             .take(MAX_ITEMS)
             .map(|(label, value)| (label, doc(value, depth + 1)))
             .collect(),
@@ -85,54 +87,23 @@ fn doc(value: &dyn PartialReflect, depth: usize) -> Doc {
             format!("{name} {{"),
             "}",
             (0..s.field_len())
-                .filter_map(|i| Some((s.name_at(i).map(str::to_owned), s.field_at(i)?)))
-                .collect::<Vec<_>>()
-                .into_iter(),
+                .filter_map(|i| Some((s.name_at(i).map(str::to_owned), s.field_at(i)?))),
             depth,
         ),
         ReflectRef::TupleStruct(t) => group(
             format!("{name}("),
             ")",
-            t.iter_fields()
-                .map(|v| (None, v))
-                .collect::<Vec<_>>()
-                .into_iter(),
+            t.iter_fields().map(|v| (None, v)),
             depth,
         ),
-        ReflectRef::Tuple(t) => group(
-            "(".into(),
-            ")",
-            t.iter_fields()
-                .map(|v| (None, v))
-                .collect::<Vec<_>>()
-                .into_iter(),
-            depth,
-        ),
-        ReflectRef::List(l) => group(
-            "[".into(),
-            "]",
-            l.iter().map(|v| (None, v)).collect::<Vec<_>>().into_iter(),
-            depth,
-        ),
-        ReflectRef::Array(a) => group(
-            "[".into(),
-            "]",
-            a.iter().map(|v| (None, v)).collect::<Vec<_>>().into_iter(),
-            depth,
-        ),
-        ReflectRef::Set(s) => group(
-            "{".into(),
-            "}",
-            s.iter().map(|v| (None, v)).collect::<Vec<_>>().into_iter(),
-            depth,
-        ),
+        ReflectRef::Tuple(t) => group("(".into(), ")", t.iter_fields().map(|v| (None, v)), depth),
+        ReflectRef::List(l) => group("[".into(), "]", l.iter().map(|v| (None, v)), depth),
+        ReflectRef::Array(a) => group("[".into(), "]", a.iter().map(|v| (None, v)), depth),
+        ReflectRef::Set(s) => group("{".into(), "}", s.iter().map(|v| (None, v)), depth),
         ReflectRef::Map(m) => group(
             "{".into(),
             "}",
-            m.iter()
-                .map(|(k, v)| (Some(flat(k)), v))
-                .collect::<Vec<_>>()
-                .into_iter(),
+            m.iter().map(|(k, v)| (Some(flat(k)), v)),
             depth,
         ),
         ReflectRef::Enum(e) => {
@@ -144,19 +115,14 @@ fn doc(value: &dyn PartialReflect, depth: usize) -> Doc {
                     format!("{variant} {{"),
                     "}",
                     (0..e.field_len())
-                        .filter_map(|i| Some((e.name_at(i).map(str::to_owned), e.field_at(i)?)))
-                        .collect::<Vec<_>>()
-                        .into_iter(),
+                        .filter_map(|i| Some((e.name_at(i).map(str::to_owned), e.field_at(i)?))),
                     depth,
                 )
             } else {
                 group(
                     format!("{variant}("),
                     ")",
-                    e.iter_fields()
-                        .map(|f| (None, f.value()))
-                        .collect::<Vec<_>>()
-                        .into_iter(),
+                    e.iter_fields().map(|f| (None, f.value())),
                     depth,
                 )
             }
@@ -238,7 +204,6 @@ fn write_pretty(doc: &Doc, indent: usize, out: &mut String) {
     out.push_str(close);
 }
 
-/// The whole value on one line.
 #[must_use]
 pub fn flat(value: &dyn PartialReflect) -> String {
     let mut out = String::new();

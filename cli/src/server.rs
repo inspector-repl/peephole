@@ -185,7 +185,6 @@ impl Server {
     }
 }
 
-/// Removes the server's files when it exits.
 struct Files;
 
 impl Drop for Files {
@@ -196,7 +195,6 @@ impl Drop for Files {
     }
 }
 
-/// Entry point of the background process.
 pub fn serve() -> i32 {
     if listening(&socket_path()) {
         eprintln!("another REPL listens on {}", socket_path().display());

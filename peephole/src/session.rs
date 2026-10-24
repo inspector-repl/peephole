@@ -9,6 +9,7 @@ use rhai::packages::{
 use rhai::{Dynamic, Engine, EvalAltResult, Scope};
 use serde_json::{Value, json};
 use std::cell::RefCell;
+use std::fmt::Write;
 use std::os::fd::AsRawFd;
 use std::rc::Rc;
 use std::time::Duration;
@@ -21,8 +22,7 @@ const CHECK_EVERY: u64 = 1 << 12;
 pub struct Variable {
     pub name: &'static str,
     pub type_name: String,
-    /// The program's variable, also for leaves that live in the scope as
-    /// copies and are written back after each input.
+    /// Leaves live in the scope as copies, written back through this.
     pub node: Node,
 }
 
@@ -31,7 +31,7 @@ pub struct Session {
     pub scope: Scope<'static>,
     pub variables: Vec<Variable>,
     output: Rc<RefCell<String>>,
-    // Nodes in `scope` point into memory `shared` keeps alive, so it goes last.
+    // Dropped last, nodes in `scope` point into memory it owns.
     _shared: Rc<Shared>,
 }
 
@@ -47,17 +47,10 @@ fn engine(output: &Rc<RefCell<String>>) -> Engine {
         engine.register_global_module(package);
     }
     let printed = Rc::clone(output);
-    engine.on_print(move |text| {
-        let mut out = printed.borrow_mut();
-        out.push_str(text);
-        out.push('\n');
-    });
+    engine.on_print(move |text| writeln!(printed.borrow_mut(), "{text}").unwrap_or_default());
     let debugged = Rc::clone(output);
-    engine.on_debug(move |text, _, _| {
-        let mut out = debugged.borrow_mut();
-        out.push_str(text);
-        out.push('\n');
-    });
+    engine
+        .on_debug(move |text, _, _| writeln!(debugged.borrow_mut(), "{text}").unwrap_or_default());
     node::register(&mut engine);
     engine
 }
@@ -69,18 +62,14 @@ impl Session {
         let mut scope = Scope::new();
         let mut variables = Vec::new();
         for local in locals {
-            // SAFETY: the session, and with it every node, ends before
-            // `inspect!` returns and the borrow of the local ends.
-            let node = match &mut local.access {
-                Access::Shared(value) => unsafe {
-                    Node::root_shared(value.as_partial_reflect(), &shared)
-                },
-                Access::Mut(value) => unsafe {
-                    Node::root(value.as_partial_reflect_mut(), &shared)
-                },
-                Access::Copy(value) => unsafe {
-                    Node::root_shared(value.as_partial_reflect(), &shared)
-                },
+            // SAFETY: the session and its nodes end before `inspect!`
+            // returns and the borrow of the local ends.
+            let node = unsafe {
+                match &mut local.access {
+                    Access::Mut(value) => Node::root(value.as_partial_reflect_mut(), &shared),
+                    Access::Shared(value) => Node::root_shared(value.as_partial_reflect(), &shared),
+                    Access::Copy(value) => Node::root_shared(value.as_partial_reflect(), &shared),
+                }
             };
             let value = node::present(node.clone());
             scope.push_dynamic(local.name, value);
@@ -128,8 +117,7 @@ impl Session {
         })
     }
 
-    /// Copies leaf variables, which live in the scope by value, back into
-    /// the program when the input changed them.
+    /// Writes changed leaf variables back into the program.
     fn store_leaves(&mut self) -> Result<(), Box<EvalAltResult>> {
         for var in &mut self.variables {
             let Some(current) = self.scope.get_value::<Dynamic>(var.name) else {
@@ -145,7 +133,6 @@ impl Session {
                 continue;
             }
             if let Err(err) = node::store(&mut var.node, &current) {
-                // Keep the scope in line with the program.
                 self.scope.set_value(var.name, before);
                 return Err(format!("cannot assign to `{}`: {err}", var.name).into());
             }
@@ -168,7 +155,7 @@ impl Session {
         let output = std::mem::take(&mut *self.output.borrow_mut());
         match result {
             Ok(value) => {
-                // A path to an `Option` field reads as `()` when it is `None`.
+                // `None` reads as `()`, which would print nothing.
                 let shown = if value.is_unit() && complete::is_path(code) {
                     "None".to_owned()
                 } else {

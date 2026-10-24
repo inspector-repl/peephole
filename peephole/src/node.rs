@@ -1,7 +1,7 @@
 //! Live views into program memory for Rhai scripts.
 
 use crate::render;
-use bevy_reflect::{PartialReflect, ReflectMut, ReflectRef};
+use bevy_reflect::{PartialReflect, ReflectMut, ReflectRef, TypeInfo};
 use rhai::{Dynamic, Engine, EvalAltResult, FnPtr, NativeCallContext};
 use std::any::TypeId;
 use std::cell::{Cell, RefCell};
@@ -19,15 +19,13 @@ pub struct Shared {
     owned: RefCell<Vec<Box<dyn PartialReflect>>>,
 }
 
-/// A reference to a value in the stopped program. Scripts work on the
-/// program's memory, never on copies.
+/// A value in the stopped program. Scripts work on its memory, never on copies.
 #[derive(Clone)]
 pub struct Node {
     ptr: *mut dyn PartialReflect,
-    /// False for values `inspect!` got as `&`, which must never be written.
+    /// False for values `inspect!` got as `&`.
     writable: bool,
-    /// The generation it was created in, `None` for values that never
-    /// move, like the program's locals.
+    /// The generation it was created in, `None` for values that never move.
     born: Option<u64>,
     shared: Rc<Shared>,
 }
@@ -37,7 +35,7 @@ impl Node {
     /// `ptr` must stay valid while any clone of the node exists, and come
     /// from a `&mut` if `writable`. The session drops all nodes before
     /// `inspect!` returns.
-    unsafe fn from_raw(
+    unsafe fn new(
         ptr: *mut dyn PartialReflect,
         writable: bool,
         born: Option<u64>,
@@ -51,22 +49,26 @@ impl Node {
         }
     }
 
-    /// A node for a value whose address never changes during the stop.
+    /// A node for a value that keeps its address during the stop.
     ///
     /// # Safety
-    /// See [`Node::from_raw`].
+    /// See [`Node::new`].
     pub unsafe fn root(value: &mut dyn PartialReflect, shared: &Rc<Shared>) -> Self {
-        // SAFETY: forwarded to the caller.
-        unsafe { Self::from_raw(std::ptr::from_mut(value), true, None, shared) }
+        unsafe { Self::new(std::ptr::from_mut(value), true, None, shared) }
     }
 
-    /// A read-only node for a value whose address never changes.
+    /// # Safety
+    /// See [`Node::new`].
+    pub unsafe fn root_shared(value: &dyn PartialReflect, shared: &Rc<Shared>) -> Self {
+        unsafe { Self::new(std::ptr::from_ref(value).cast_mut(), false, None, shared) }
+    }
+
+    /// A node for a value that a write to a container may move.
     ///
     /// # Safety
-    /// See [`Node::from_raw`].
-    pub unsafe fn root_shared(value: &dyn PartialReflect, shared: &Rc<Shared>) -> Self {
-        // SAFETY: forwarded to the caller, and `writable` is false.
-        unsafe { Self::from_raw(std::ptr::from_ref(value).cast_mut(), false, None, shared) }
+    /// See [`Node::new`].
+    unsafe fn moving(ptr: *mut dyn PartialReflect, writable: bool, shared: &Rc<Shared>) -> Self {
+        unsafe { Self::new(ptr, writable, Some(shared.generation.get()), shared) }
     }
 
     fn check(&self) -> Res<()> {
@@ -85,7 +87,7 @@ impl Node {
 
     pub fn get(&mut self) -> Res<&dyn PartialReflect> {
         self.check()?;
-        // SAFETY: valid per `from_raw`, and no write since `born` moved it.
+        // SAFETY: valid per `new`, and `check` rules out moves.
         Ok(unsafe { &*self.ptr })
     }
 
@@ -97,20 +99,6 @@ impl Node {
         // SAFETY: as in `get`, and the pointer came from a `&mut`.
         Ok(unsafe { &mut *self.ptr })
     }
-
-    /// A node for `value`, which lives inside this node's value.
-    fn child(&self, value: *mut dyn PartialReflect) -> Dynamic {
-        // SAFETY: values reachable from a node live as long as the node.
-        // Children of read-only nodes stay read-only.
-        present(unsafe {
-            Self::from_raw(
-                value,
-                self.writable,
-                Some(self.shared.generation.get()),
-                &self.shared,
-            )
-        })
-    }
 }
 
 fn is_option(value: &dyn PartialReflect) -> bool {
@@ -119,7 +107,7 @@ fn is_option(value: &dyn PartialReflect) -> bool {
         .starts_with("core::option::Option<")
 }
 
-/// How scripts see a node: leaves as Rhai values, `Some(x)` as `x` and
+/// How scripts see a node: leaves as Rhai values, `Some(x)` as `x`,
 /// `None` as `()`, everything else as the node itself.
 pub fn present(mut node: Node) -> Dynamic {
     let Ok(value) = node.get() else {
@@ -139,8 +127,6 @@ pub fn present(mut node: Node) -> Dynamic {
     Dynamic::from(node)
 }
 
-impl Node {}
-
 macro_rules! leaf_to_dynamic {
     ($value:expr; lossless: $($small:ty),*; checked: $($big:ty),*) => {
         $(if let Some(x) = $value.try_downcast_ref::<$small>() { return Some(Dynamic::from(i64::from(*x))); })*
@@ -150,7 +136,7 @@ macro_rules! leaf_to_dynamic {
     };
 }
 
-/// Numbers, strings and the like as Rhai values, `None` for anything else.
+/// Numbers, strings and the like as Rhai values.
 pub fn leaf(value: &dyn PartialReflect) -> Option<Dynamic> {
     leaf_to_dynamic!(value; lossless: i8, i16, i32, i64, u8, u16, u32; checked: isize, usize, u64, i128, u128);
     if let Some(x) = value.try_downcast_ref::<f64>() {
@@ -177,21 +163,6 @@ pub fn leaf(value: &dyn PartialReflect) -> Option<Dynamic> {
     None
 }
 
-/// A node for memory an exposed function returned a `&mut` to.
-fn keep_borrowed(value: &mut dyn PartialReflect, shared: &Rc<Shared>) -> Dynamic {
-    // SAFETY: the function borrowed from a node argument, so the memory
-    // belongs to the program. It may move, so the node is not a root.
-    let node = unsafe {
-        Node::from_raw(
-            std::ptr::from_mut(value),
-            true,
-            Some(shared.generation.get()),
-            shared,
-        )
-    };
-    present(node)
-}
-
 /// Keeps a value returned by an exposed function alive for the stop.
 fn keep(value: Box<dyn PartialReflect>, shared: &Rc<Shared>) -> Dynamic {
     let mut owned = shared.owned.borrow_mut();
@@ -201,106 +172,119 @@ fn keep(value: Box<dyn PartialReflect>, shared: &Rc<Shared>) -> Dynamic {
     present(unsafe { Node::root(value.as_mut(), shared) })
 }
 
-macro_rules! assign_int {
-    ($target:expr, $value:expr; $($t:ty),*) => {
-        $(if let Some(x) = $target.try_downcast_mut::<$t>() {
-            let int = $value.as_int().map_err(|_| mismatch($value, stringify!($t)))?;
-            *x = <$t>::try_from(int).map_err(|_| format!("{int} is out of range for {}", stringify!($t)))?;
-            return Ok(());
-        })*
-    };
-}
-
 fn mismatch(value: &Dynamic, target: &str) -> String {
     format!("cannot assign {} to {target}", value.type_name())
 }
 
-/// Integers as floats, exact for the `i32` range only, so nothing rounds.
+/// Exact for the `i32` range only, so nothing rounds.
 fn float_from_int(value: &Dynamic) -> Option<f64> {
     i32::try_from(value.as_int().ok()?).ok().map(f64::from)
 }
 
-/// `()` becomes `None`, anything else `Some(value)`.
-fn assign_option(target: &mut dyn PartialReflect, value: &Dynamic, shared: &Shared) -> Res<()> {
-    use bevy_reflect::TypeInfo;
+fn float(value: &Dynamic, target: &str) -> Res<f64> {
+    Ok(value
+        .as_float()
+        .ok()
+        .or_else(|| float_from_int(value))
+        .ok_or_else(|| mismatch(value, target))?)
+}
+
+macro_rules! convert_int {
+    ($value:expr, $ty:expr; $($t:ty),*) => {
+        $(if $ty == TypeId::of::<$t>() {
+            let int = $value.as_int().map_err(|_| mismatch($value, stringify!($t)))?;
+            let x = <$t>::try_from(int).map_err(|_| format!("{int} is out of range for {}", stringify!($t)))?;
+            return Ok(Box::new(x));
+        })*
+    };
+}
+
+/// `value` as the Rust type `ty`.
+fn convert(value: &Dynamic, ty: TypeId, type_path: &str) -> Res<Box<dyn PartialReflect>> {
+    convert_int!(value, ty; i8, i16, i32, i64, isize, u8, u16, u32, u64, usize, i128, u128);
+    if ty == TypeId::of::<f64>() {
+        return Ok(Box::new(float(value, "f64")?));
+    }
+    if ty == TypeId::of::<f32>() {
+        #[allow(clippy::cast_possible_truncation)]
+        return Ok(Box::new(float(value, "f32")? as f32));
+    }
+    if ty == TypeId::of::<bool>() {
+        return Ok(Box::new(
+            value.as_bool().map_err(|_| mismatch(value, "bool"))?,
+        ));
+    }
+    if ty == TypeId::of::<char>() {
+        return Ok(Box::new(
+            value.as_char().map_err(|_| mismatch(value, "char"))?,
+        ));
+    }
+    if ty == TypeId::of::<String>() {
+        return Ok(Box::new(
+            value
+                .clone()
+                .into_string()
+                .map_err(|_| mismatch(value, "String"))?,
+        ));
+    }
+    if let Some(mut node) = value.clone().try_cast::<Node>() {
+        return node
+            .get()?
+            .reflect_clone()
+            .map(<dyn bevy_reflect::Reflect>::into_partial_reflect)
+            .map_err(|err| err.to_string().into());
+    }
+    Err(mismatch(value, type_path).into())
+}
+
+/// `()` as `None`, anything else as `Some(value)`.
+fn convert_option(info: &TypeInfo, value: &Dynamic) -> Res<Box<dyn PartialReflect>> {
     use bevy_reflect::enums::{DynamicEnum, DynamicVariant};
     use bevy_reflect::tuple::DynamicTuple;
-    let option = if value.is_unit() {
-        DynamicEnum::new("None", DynamicVariant::Unit)
-    } else {
-        let Some(TypeInfo::Enum(info)) = target.get_represented_type_info() else {
-            return Err("unknown Option type".into());
-        };
-        let inner = info
-            .variant("Some")
-            .and_then(|variant| variant.as_tuple_variant().ok())
-            .and_then(|variant| variant.field_at(0))
-            .ok_or("unknown Option type")?;
-        let mut tuple = DynamicTuple::default();
-        tuple.insert_boxed(to_owned(value, inner.type_id(), inner.type_path())?);
-        DynamicEnum::new("Some", DynamicVariant::Tuple(tuple))
-    };
-    target.try_apply(&option).map_err(|err| err.to_string())?;
-    shared.generation.set(shared.generation.get() + 1);
-    Ok(())
+    if value.is_unit() {
+        return Ok(Box::new(DynamicEnum::new("None", DynamicVariant::Unit)));
+    }
+    let inner = info
+        .as_enum()
+        .ok()
+        .and_then(|info| info.variant("Some"))
+        .and_then(|variant| variant.as_tuple_variant().ok())
+        .and_then(|variant| variant.field_at(0))
+        .ok_or("unknown Option type")?;
+    let mut tuple = DynamicTuple::default();
+    tuple.insert_boxed(convert(value, inner.type_id(), inner.type_path())?);
+    Ok(Box::new(DynamicEnum::new(
+        "Some",
+        DynamicVariant::Tuple(tuple),
+    )))
 }
 
-/// Writes `value` into `target`.
-fn assign(target: &mut dyn PartialReflect, value: &Dynamic, shared: &Shared) -> Res<()> {
-    if is_option(target) && !value.is::<Node>() {
-        return assign_option(target, value, shared);
-    }
-    if let Some(mut source) = value.clone().try_cast::<Node>() {
-        if std::ptr::addr_eq(source.ptr, std::ptr::from_mut(target)) {
-            return Ok(()); // Rhai writes nested results back to their parent.
-        }
-        target
-            .try_apply(source.get()?)
-            .map_err(|err| err.to_string())?;
-        shared.generation.set(shared.generation.get() + 1);
-        return Ok(());
-    }
-    assign_int!(target, value; i8, i16, i32, i64, isize, u8, u16, u32, u64, usize, i128, u128);
-    if let Some(x) = target.try_downcast_mut::<f64>() {
-        *x = value
-            .as_float()
-            .ok()
-            .or_else(|| float_from_int(value))
-            .ok_or_else(|| mismatch(value, "f64"))?;
-        return Ok(());
-    }
-    if let Some(x) = target.try_downcast_mut::<f32>() {
-        #[allow(clippy::cast_possible_truncation)]
-        let float = value
-            .as_float()
-            .ok()
-            .or_else(|| float_from_int(value))
-            .ok_or_else(|| mismatch(value, "f32"))? as f32;
-        *x = float;
-        return Ok(());
-    }
-    if let Some(x) = target.try_downcast_mut::<bool>() {
-        *x = value.as_bool().map_err(|_| mismatch(value, "bool"))?;
-        return Ok(());
-    }
-    if let Some(x) = target.try_downcast_mut::<char>() {
-        *x = value.as_char().map_err(|_| mismatch(value, "char"))?;
-        return Ok(());
-    }
-    if let Some(x) = target.try_downcast_mut::<String>() {
-        *x = value
-            .clone()
-            .into_string()
-            .map_err(|_| mismatch(value, "String"))?;
-        return Ok(());
-    }
-    Err(mismatch(value, target.reflect_short_type_path()).into())
-}
-
-/// Writes `value` into the program variable behind `node`.
 pub fn store(node: &mut Node, value: &Dynamic) -> Res<()> {
+    if let Some(source) = value.clone().try_cast::<Node>()
+        && std::ptr::addr_eq(source.ptr, node.ptr)
+    {
+        // Rhai writes properties back after calling methods on them.
+        return Ok(());
+    }
     let shared = Rc::clone(&node.shared);
-    assign(node.get_mut()?, value, &shared)
+    let target = node.get_mut()?;
+    let info = target
+        .get_represented_type_info()
+        .ok_or_else(|| mismatch(value, target.reflect_short_type_path()))?;
+    let new = if is_option(target) && !value.is::<Node>() {
+        convert_option(info, value)?
+    } else {
+        convert(value, info.type_id(), info.type_path())?
+    };
+    // Leaves own no memory that other nodes could point into.
+    let moves = leaf(target).is_none();
+    target
+        .try_apply(new.as_ref())
+        .map_err(|err| err.to_string())?;
+    if moves {
+        shared.generation.set(shared.generation.get() + 1);
+    }
+    Ok(())
 }
 
 /// Names reachable with `.name`, with their type.
@@ -420,7 +404,7 @@ fn locate_mut<'a>(
     value: &'a mut dyn PartialReflect,
     step: &Step<'_>,
 ) -> Res<&'a mut dyn PartialReflect> {
-    // Checked on the shared path first, so errors don't need a second borrow.
+    // Errors come from the shared path, which needs no second borrow.
     locate(value, step)?;
     let found = match *step {
         Step::Member(name) => match value.reflect_mut() {
@@ -444,33 +428,23 @@ fn locate_mut<'a>(
     found.ok_or_else(|| "not found".into())
 }
 
-/// The value one `step` below `node`, live and as writable as `node`.
-pub fn step(node: &mut Node, step: &Step<'_>) -> Res<Dynamic> {
+fn child(node: &mut Node, step: &Step<'_>) -> Res<Node> {
     let ptr = if node.writable {
         std::ptr::from_mut(locate_mut(node.get_mut()?, step)?)
     } else {
         std::ptr::from_ref(locate(node.get()?, step)?).cast_mut()
     };
-    Ok(node.child(ptr))
+    // SAFETY: values inside a node live as long as the node.
+    Ok(unsafe { Node::moving(ptr, node.writable, &node.shared) })
 }
 
-pub fn get_member(node: &mut Node, name: &str) -> Res<Dynamic> {
-    step(node, &Step::Member(name))
-}
-
-pub fn get_element(node: &mut Node, index: i64) -> Res<Dynamic> {
-    step(node, &Step::Index(index))
+/// The value one `step` below `node`, live and as writable as `node`.
+pub fn step(node: &mut Node, step: &Step<'_>) -> Res<Dynamic> {
+    child(node, step).map(present)
 }
 
 fn set(node: &mut Node, step: &Step<'_>, value: &Dynamic) -> Res<()> {
-    if let Some(source) = value.clone().try_cast::<Node>() {
-        let target = locate(node.get()?, step)?;
-        if std::ptr::addr_eq(source.ptr, std::ptr::from_ref(target)) {
-            return Ok(()); // Rhai writes nested results back to their parent.
-        }
-    }
-    let shared = Rc::clone(&node.shared);
-    assign(locate_mut(node.get_mut()?, step)?, value, &shared)
+    store(&mut child(node, step)?, value)
 }
 
 /// The elements of a list-like value, or the values of a map.
@@ -499,14 +473,19 @@ pub fn elements(node: &mut Node) -> Res<Vec<Dynamic>> {
                     m.get(key.as_ref())
                         .map(|v| std::ptr::from_ref(v).cast_mut())
                 };
-                out.extend(ptr.map(|ptr| node.child(ptr)));
+                // SAFETY: as in `child`.
+                out.extend(
+                    ptr.map(|ptr| {
+                        present(unsafe { Node::moving(ptr, node.writable, &node.shared) })
+                    }),
+                );
             }
             return Ok(out);
         }
         _ => return Err(format!("{} is not a collection", value.reflect_short_type_path()).into()),
     };
     (0..count)
-        .map(|i| get_element(node, i64::try_from(i).unwrap_or(i64::MAX)))
+        .map(|i| step(node, &Step::Index(i64::try_from(i).unwrap_or(i64::MAX))))
         .collect()
 }
 
@@ -532,51 +511,6 @@ impl IntoIterator for Node {
     }
 }
 
-macro_rules! dynamic_to_owned {
-    ($value:expr, $ty:expr; $($t:ty),*) => {
-        $(if $ty == TypeId::of::<$t>() {
-            let int = $value.as_int().map_err(|_| mismatch($value, stringify!($t)))?;
-            let x = <$t>::try_from(int).map_err(|_| format!("{int} is out of range for {}", stringify!($t)))?;
-            return Ok(Box::new(x));
-        })*
-    };
-}
-
-fn to_owned(value: &Dynamic, ty: TypeId, type_path: &str) -> Res<Box<dyn PartialReflect>> {
-    dynamic_to_owned!(value, ty; i8, i16, i32, i64, isize, u8, u16, u32, u64, usize, i128, u128);
-    if ty == TypeId::of::<f64>() {
-        return Ok(Box::new(
-            value
-                .as_float()
-                .ok()
-                .or_else(|| float_from_int(value))
-                .ok_or_else(|| mismatch(value, "f64"))?,
-        ));
-    }
-    if ty == TypeId::of::<bool>() {
-        return Ok(Box::new(
-            value.as_bool().map_err(|_| mismatch(value, "bool"))?,
-        ));
-    }
-    if ty == TypeId::of::<String>() {
-        return Ok(Box::new(
-            value
-                .clone()
-                .into_string()
-                .map_err(|_| mismatch(value, "String"))?,
-        ));
-    }
-    if let Some(mut node) = value.clone().try_cast::<Node>() {
-        return node
-            .get()?
-            .reflect_clone()
-            .map(<dyn bevy_reflect::Reflect>::into_partial_reflect)
-            .map_err(|err| err.to_string().into());
-    }
-    Err(mismatch(value, type_path).into())
-}
-
-/// Calls an exposed function with Rhai arguments.
 fn call(
     function: &bevy_reflect::func::DynamicFunction<'static>,
     args: &[&mut Dynamic],
@@ -607,7 +541,7 @@ fn call(
             (Ownership::Ref, Some(node)) => list.push_ref(node.get()?),
             (Ownership::Mut, Some(node)) => list.push_mut(node.get_mut()?),
             (Ownership::Owned, _) => {
-                list.push_boxed(to_owned(arg, info.type_id(), info.type_path())?);
+                list.push_boxed(convert(arg, info.type_id(), info.type_path())?);
             }
             _ => {
                 return Err(format!(
@@ -624,7 +558,10 @@ fn call(
     Ok(
         match (function.call(list).map_err(|err| err.to_string())?, &shared) {
             (Return::Owned(value), Some(shared)) => keep(value, shared),
-            (Return::Mut(value), Some(shared)) => keep_borrowed(value, shared),
+            // SAFETY: borrowed from a node argument, so it is program memory.
+            (Return::Mut(value), Some(shared)) => {
+                present(unsafe { Node::moving(std::ptr::from_mut(value), true, shared) })
+            }
             (Return::Owned(value), None) => copy(value.as_ref()),
             (Return::Ref(value), _) => copy(value),
             (Return::Mut(value), None) => copy(value),
@@ -649,12 +586,11 @@ fn filter(context: &NativeCallContext, node: &mut Node, function: &FnPtr) -> Res
     Ok(out)
 }
 
-/// Registers `Node` and every exposed function with `engine`.
 pub fn register(engine: &mut Engine) {
     engine
         .register_type_with_name::<Node>("value")
-        .register_indexer_get(get_member)
-        .register_indexer_get(get_element)
+        .register_indexer_get(|node: &mut Node, name: &str| step(node, &Step::Member(name)))
+        .register_indexer_get(|node: &mut Node, index: i64| step(node, &Step::Index(index)))
         .register_indexer_set(|node: &mut Node, name: &str, value: Dynamic| {
             set(node, &Step::Member(name), &value)
         })
@@ -733,13 +669,13 @@ mod tests {
         let mut target = unsafe { Node::root(&mut small, &shared) };
         let source = unsafe { Node::root(&mut large, &shared) };
 
-        let mut items = get_member(&mut target, "items").unwrap().cast::<Node>();
-        let mut first = get_element(&mut items, 0).unwrap().cast::<Node>();
+        let mut items = child(&mut target, &Step::Member("items")).unwrap();
+        let mut first = child(&mut items, &Step::Index(0)).unwrap();
         store(&mut target, &Dynamic::from(source)).unwrap();
 
         let err = first.get().map(|_| ()).unwrap_err().to_string();
         assert!(err.contains("stale reference"), "{err}");
-        let mut fresh = get_member(&mut target, "items").unwrap().cast::<Node>();
+        let mut fresh = child(&mut target, &Step::Member("items")).unwrap();
         assert_eq!(len(&mut fresh).unwrap(), 3);
         drop((target, items, fresh));
         assert_eq!(small.items.len(), 3);

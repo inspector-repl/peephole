@@ -22,25 +22,22 @@ pub use bevy_reflect::{self, Reflect};
 use bevy_reflect::func::{DynamicFunction, IntoFunction};
 use std::sync::Mutex;
 
-/// Where `inspect!` stopped.
 #[doc(hidden)]
 pub struct Location {
     pub file: &'static str,
-    /// The crate's directory. `file` is relative to it or to its workspace.
+    /// `file` is relative to this or to its workspace.
     pub manifest_dir: &'static str,
     pub line: u32,
     pub function: &'static str,
 }
 
-/// How the REPL may access a variable.
 pub(crate) enum Access<'a> {
     Shared(&'a dyn Reflect),
     Mut(&'a mut dyn Reflect),
-    /// A read-only copy, for borrowed data reflection can't hold like `&str`.
+    /// For borrows reflection can't hold, like `&str`.
     Copy(Box<dyn Reflect>),
 }
 
-/// A variable handed to the REPL.
 pub struct Local<'a> {
     pub(crate) name: &'static str,
     pub(crate) type_name: &'static str,
@@ -73,9 +70,8 @@ impl<'a> Local<'a> {
     }
 }
 
-// `inspect!` borrows each argument and picks the right `Local` from the
-// borrow's type. Method lookup tries `&&&&Wrap`, then `&&&Wrap`, then
-// `&&Wrap`, so `&str` wins over `&&T`, which wins over a plain value.
+// Autoref specialization: method lookup tries the most `&`s first, so
+// `&str` beats `&&T`, which beats `&T`/`&mut T`.
 #[doc(hidden)]
 pub struct Wrap<R>(std::cell::Cell<Option<R>>);
 
