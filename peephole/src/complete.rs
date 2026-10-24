@@ -1,6 +1,6 @@
 //! Completion and live previews, both from read-only path lookups.
 
-use crate::node::{self, Node};
+use crate::node::{self, Node, Step};
 use crate::render;
 use crate::session::Session;
 use bevy_reflect::{PartialReflect, ReflectRef};
@@ -34,11 +34,6 @@ fn methods(value: &dyn PartialReflect) -> Vec<(&'static str, &'static str)> {
         _ => {}
     }
     out
-}
-
-enum Step<'a> {
-    Member(&'a str),
-    Index(i64),
 }
 
 fn is_ident(c: char) -> bool {
@@ -76,16 +71,18 @@ fn parse(expr: &str) -> Option<(&str, Vec<Step<'_>>)> {
     Some((root, steps))
 }
 
+/// Whether `code` is a plain path like `order.items[0].name`.
+pub fn is_path(code: &str) -> bool {
+    parse(code.trim()).is_some()
+}
+
 /// Looks up a path without running code, so it has no side effects.
 pub fn path(session: &Session, expr: &str) -> Option<Dynamic> {
     let (root, steps) = parse(expr.trim())?;
     let mut value = session.scope.get_value::<Dynamic>(root)?;
     for step in steps {
         let mut node = value.try_cast::<Node>()?;
-        value = match step {
-            Step::Member(name) => node::get_member(&mut node, name).ok()?,
-            Step::Index(index) => node::get_element(&mut node, index).ok()?,
-        };
+        value = node::step(&mut node, &step).ok()?;
     }
     Some(value)
 }

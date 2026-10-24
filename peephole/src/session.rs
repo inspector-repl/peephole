@@ -1,7 +1,7 @@
 //! Serves one stop: evaluates requests until the client continues.
 
 use crate::node::{self, Node, Shared};
-use crate::{Local, Location, complete, render};
+use crate::{Access, Local, Location, complete, render};
 use peephole_protocol::{Connection, readable, socket_path};
 use rhai::packages::{
     BasicArrayPackage, BasicMathPackage, CorePackage, LogicPackage, MoreStringPackage, Package,
@@ -71,9 +71,18 @@ impl Session {
         for local in locals {
             // SAFETY: the session, and with it every node, ends before
             // `inspect!` returns and the borrow of the local ends.
-            let node = unsafe { Node::root(local.value.as_partial_reflect_mut(), &shared) };
-            let value = node::leaf(local.value.as_partial_reflect())
-                .unwrap_or_else(|| Dynamic::from(node.clone()));
+            let node = match &mut local.access {
+                Access::Shared(value) => unsafe {
+                    Node::root_shared(value.as_partial_reflect(), &shared)
+                },
+                Access::Mut(value) => unsafe {
+                    Node::root(value.as_partial_reflect_mut(), &shared)
+                },
+                Access::Copy(value) => unsafe {
+                    Node::root_shared(value.as_partial_reflect(), &shared)
+                },
+            };
+            let value = node::present(node.clone());
             scope.push_dynamic(local.name, value);
             variables.push(Variable {
                 name: local.name,
@@ -108,6 +117,7 @@ impl Session {
             .collect();
         json!({
             "file": location.file,
+            "manifest_dir": location.manifest_dir,
             "line": location.line,
             "function": location.function,
             "pid": std::process::id(),
@@ -119,16 +129,26 @@ impl Session {
     }
 
     /// Copies leaf variables, which live in the scope by value, back into
-    /// the program.
+    /// the program when the input changed them.
     fn store_leaves(&mut self) -> Result<(), Box<EvalAltResult>> {
         for var in &mut self.variables {
             let Some(current) = self.scope.get_value::<Dynamic>(var.name) else {
                 continue;
             };
-            if current.is::<Node>() {
+            let program = var.node.get()?;
+            let Some(before) = node::leaf(program) else {
+                continue;
+            };
+            if before.type_name() == current.type_name()
+                && before.to_string() == current.to_string()
+            {
                 continue;
             }
-            node::store(&mut var.node, &current)?;
+            if let Err(err) = node::store(&mut var.node, &current) {
+                // Keep the scope in line with the program.
+                self.scope.set_value(var.name, before);
+                return Err(format!("cannot assign to `{}`: {err}", var.name).into());
+            }
         }
         Ok(())
     }
@@ -147,10 +167,27 @@ impl Session {
             .and_then(|value| self.store_leaves().map(|()| value));
         let output = std::mem::take(&mut *self.output.borrow_mut());
         match result {
-            Ok(value) => json!({"value": render::result(&value), "output": output, "error": false}),
+            Ok(value) => {
+                // A path to an `Option` field reads as `()` when it is `None`.
+                let shown = if value.is_unit() && complete::is_path(code) {
+                    "None".to_owned()
+                } else {
+                    render::result(&value)
+                };
+                json!({"value": shown, "output": output, "error": false})
+            }
             Err(err) => {
                 let text = match *err {
                     EvalAltResult::ErrorTerminated(..) => "interrupted".to_owned(),
+                    EvalAltResult::ErrorFunctionNotFound(ref signature, _)
+                        if signature.contains("(value") =>
+                    {
+                        let name = signature.split(' ').next().unwrap_or_default();
+                        format!(
+                            "{err}\nProgram methods are only callable after \
+                             peephole::expose(\"{name}\", Type::{name})."
+                        )
+                    }
                     other => other.to_string(),
                 };
                 json!({"value": text, "output": output, "error": true})

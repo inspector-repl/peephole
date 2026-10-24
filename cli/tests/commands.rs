@@ -118,7 +118,47 @@ fn evaluates_until_continued() {
     );
     let resumed = state.peephole(&["continue"]);
     assert_eq!(resumed.status.code(), Some(0));
-    assert_eq!(finish(program).trim(), "qty=10 attempts=2 total=6.5");
+    assert_eq!(
+        finish(program).trim(),
+        "qty=10 attempts=2 total=6.5 coupon=None"
+    );
+}
+
+/// Evaluates `code` and returns stdout, or stderr if it failed.
+fn eval(state: &State, code: &str) -> (Option<i32>, String) {
+    let output = state.peephole(&["eval", code]);
+    (output.status.code(), text(&output).trim().to_owned())
+}
+
+#[test]
+fn handles_read_only_values_options_and_methods() {
+    let state = State::new();
+    let program = state.program();
+    assert_eq!(eval(&state, "").0, Some(0));
+
+    let (code, shown) = eval(&state, "names.bob = 5");
+    assert_eq!(code, Some(1), "{shown}");
+    assert!(shown.contains("read-only"), "{shown}");
+    assert_eq!(eval(&state, "names.bob"), (Some(0), "2".into()));
+
+    // Methods on properties of read-only values write the property back.
+    let shipped = r#"history.filter(|e| e.status.variant() == "Shipped").len()"#;
+    assert_eq!(eval(&state, shipped), (Some(0), "1".into()));
+
+    assert_eq!(eval(&state, "order.coupon"), (Some(0), "None".into()));
+    let coupon = r#"order.coupon = "SAVE"; order.coupon + "!""#;
+    assert_eq!(eval(&state, coupon), (Some(0), r#""SAVE!""#.into()));
+    assert_eq!(eval(&state, "order.coupon = ()").0, Some(0));
+
+    let (code, shown) = eval(&state, "order.secret_code()");
+    assert_eq!(code, Some(1));
+    assert!(
+        shown.contains(r#"peephole::expose("secret_code""#),
+        "{shown}"
+    );
+
+    state.peephole(&["continue"]);
+    assert!(finish(program).trim_end().ends_with("coupon=None"));
 }
 
 #[test]

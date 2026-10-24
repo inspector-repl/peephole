@@ -26,73 +26,137 @@ use std::sync::Mutex;
 #[doc(hidden)]
 pub struct Location {
     pub file: &'static str,
+    /// The crate's directory. `file` is relative to it or to its workspace.
+    pub manifest_dir: &'static str,
     pub line: u32,
     pub function: &'static str,
 }
 
+/// How the REPL may access a variable.
+pub(crate) enum Access<'a> {
+    Shared(&'a dyn Reflect),
+    Mut(&'a mut dyn Reflect),
+    /// A read-only copy, for borrowed data reflection can't hold like `&str`.
+    Copy(Box<dyn Reflect>),
+}
+
 /// A variable handed to the REPL.
 pub struct Local<'a> {
-    name: &'static str,
-    type_name: &'static str,
-    value: &'a mut dyn Reflect,
+    pub(crate) name: &'static str,
+    pub(crate) type_name: &'static str,
+    pub(crate) access: Access<'a>,
 }
 
 impl<'a> Local<'a> {
-    pub fn new<T: Reflect>(name: &'static str, value: &'a mut T) -> Self {
+    pub fn shared<T: Reflect>(name: &'static str, value: &'a T) -> Self {
         Self {
             name,
             type_name: std::any::type_name::<T>(),
-            value,
+            access: Access::Shared(value),
+        }
+    }
+
+    pub fn copied<T: Reflect>(name: &'static str, type_name: &'static str, value: T) -> Self {
+        Self {
+            name,
+            type_name,
+            access: Access::Copy(Box::new(value)),
+        }
+    }
+
+    pub fn writable<T: Reflect>(name: &'static str, value: &'a mut T) -> Self {
+        Self {
+            name,
+            type_name: std::any::type_name::<T>(),
+            access: Access::Mut(value),
         }
     }
 }
 
-// `inspect!` takes both locals and `&mut` references to reflected values.
-// Method lookup tries `&&Wrap` before `&Wrap`, so references win.
+// `inspect!` borrows each argument and picks the right `Local` from the
+// borrow's type. Method lookup tries `&&&&Wrap`, then `&&&Wrap`, then
+// `&&Wrap`, so `&str` wins over `&&T`, which wins over a plain value.
 #[doc(hidden)]
-pub struct Wrap<'a, T>(std::cell::Cell<Option<&'a mut T>>);
+pub struct Wrap<R>(std::cell::Cell<Option<R>>);
 
-impl<'a, T> Wrap<'a, T> {
-    pub fn new(value: &'a mut T) -> Self {
-        Self(std::cell::Cell::new(Some(value)))
+impl<R> Wrap<R> {
+    pub fn new(borrow: R) -> Self {
+        Self(std::cell::Cell::new(Some(borrow)))
     }
 
-    fn take(&self) -> &'a mut T {
+    fn take(&self) -> R {
         self.0.take().expect("inspect! takes each variable once")
     }
 }
 
 #[doc(hidden)]
-pub trait ViaRef<'a> {
+pub trait ViaStr<'a> {
     fn local(&self, name: &'static str) -> Local<'a>;
 }
 
-impl<'a, T: Reflect> ViaRef<'a> for &Wrap<'a, &mut T> {
+impl<'a> ViaStr<'a> for &&&Wrap<&&str> {
     fn local(&self, name: &'static str) -> Local<'a> {
-        Local::new(name, &mut **self.take())
+        Local::copied(name, "&str", (*self.take()).to_owned())
     }
 }
 
 #[doc(hidden)]
-pub trait ViaValue<'a> {
+pub trait ViaSharedRef<'a> {
     fn local(&self, name: &'static str) -> Local<'a>;
 }
 
-impl<'a, T: Reflect> ViaValue<'a> for Wrap<'a, T> {
+impl<'a, T: Reflect> ViaSharedRef<'a> for &&Wrap<&'a &T> {
     fn local(&self, name: &'static str) -> Local<'a> {
-        Local::new(name, self.take())
+        Local::shared(name, *self.take())
     }
 }
 
-/// Stops here so a `peephole` REPL can inspect and change the listed
-/// variables. Their types must derive [`Reflect`]. Owned locals need a
-/// `mut` binding. Pass `&mut` parameters dereferenced: `inspect!(*order)`.
+#[doc(hidden)]
+pub trait ViaShared<'a> {
+    fn local(&self, name: &'static str) -> Local<'a>;
+}
+
+impl<'a, T: Reflect> ViaShared<'a> for &Wrap<&'a T> {
+    fn local(&self, name: &'static str) -> Local<'a> {
+        Local::shared(name, self.take())
+    }
+}
+
+#[doc(hidden)]
+pub trait ViaMut<'a> {
+    fn local(&self, name: &'static str) -> Local<'a>;
+}
+
+impl<'a, T: Reflect> ViaMut<'a> for &Wrap<&'a mut T> {
+    fn local(&self, name: &'static str) -> Local<'a> {
+        Local::writable(name, self.take())
+    }
+}
+
+/// Stops here so a `peephole` REPL can inspect the listed variables.
+/// Their types must derive [`Reflect`].
+///
+/// Variables are read-only unless marked `mut`, which needs a `mut`
+/// binding like any `&mut` borrow:
+///
+/// ```ignore
+/// fn checkout(order: &mut Order, config: &Config) {
+///     let mut retries = 3;
+///     peephole::inspect!(mut *order, config, mut retries, dir = config.dir());
+/// }
+/// ```
 #[macro_export]
 macro_rules! inspect {
-    ($($var:expr),* $(,)?) => {
+    ($($args:tt)*) => {{
+        #[allow(unused_imports)]
+        use $crate::{ViaMut as _, ViaShared as _, ViaSharedRef as _, ViaStr as _};
         $crate::stop(
             &$crate::Location {
                 file: ::core::file!(),
+                manifest_dir: match ::core::option_env!("CARGO_MANIFEST_DIR") {
+                    ::core::option::Option::Some(dir) => dir,
+                    ::core::option::Option::None => "",
+                },
                 line: ::core::line!(),
                 function: {
                     fn here() {}
@@ -100,11 +164,31 @@ macro_rules! inspect {
                     &name[..name.len() - "::here".len()]
                 },
             },
-            &mut [$({
-                #[allow(unused_imports)]
-                use $crate::{ViaRef as _, ViaValue as _};
-                (&&$crate::Wrap::new(&mut $var)).local($crate::local_name(::core::stringify!($var)))
-            }),*],
+            &mut $crate::__locals!([] $($args)*),
+        );
+    }};
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __locals {
+    ([$($out:expr),*] $(,)?) => { [$($out),*] };
+    ([$($out:expr),*] mut $value:expr $(, $($rest:tt)*)?) => {
+        $crate::__locals!(
+            [$($out,)* (&&&&$crate::Wrap::new(&mut $value)).local($crate::local_name(::core::stringify!($value)))]
+            $($($rest)*)?
+        )
+    };
+    ([$($out:expr),*] $name:ident = $value:expr $(, $($rest:tt)*)?) => {
+        $crate::__locals!(
+            [$($out,)* (&&&&$crate::Wrap::new(&$value)).local(::core::stringify!($name))]
+            $($($rest)*)?
+        )
+    };
+    ([$($out:expr),*] $value:expr $(, $($rest:tt)*)?) => {
+        $crate::__locals!(
+            [$($out,)* (&&&&$crate::Wrap::new(&$value)).local($crate::local_name(::core::stringify!($value)))]
+            $($($rest)*)?
         )
     };
 }

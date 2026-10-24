@@ -250,7 +250,7 @@ pub fn flat(value: &dyn PartialReflect) -> String {
 #[must_use]
 pub fn preview(value: &Dynamic, max: usize) -> String {
     let text = match value.clone().try_cast::<Node>() {
-        Some(mut node) => node.get().map_or_else(|err| err.to_string(), |v| flat(v)),
+        Some(mut node) => node.get().map_or_else(|err| err.to_string(), flat),
         None => dynamic(value, false),
     };
     if text.chars().count() <= max {

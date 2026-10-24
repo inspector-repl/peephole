@@ -24,15 +24,23 @@ pub fn str_field<'a>(value: &'a Value, key: &str) -> &'a str {
     value.get(key).and_then(Value::as_str).unwrap_or_default()
 }
 
-/// `file!()` is relative to where rustc ran, usually the workspace root.
+/// `file!()` is relative to where rustc ran: the crate or its workspace
+/// root. The client's own directory comes last, it may hold another
+/// project with the same file names.
 fn source(stop: &Value) -> Option<PathBuf> {
     let file = Path::new(str_field(stop, "file"));
-    let mut candidates = vec![file.to_path_buf()];
-    let mut dir = Some(Path::new(str_field(stop, "cwd")));
-    while let Some(base) = dir.filter(|d| !d.as_os_str().is_empty()) {
-        candidates.push(base.join(file));
-        dir = base.parent();
+    if file.is_absolute() {
+        return Some(file.to_path_buf());
     }
+    let mut candidates = Vec::new();
+    for key in ["manifest_dir", "cwd"] {
+        let mut dir = Some(Path::new(str_field(stop, key)));
+        while let Some(base) = dir.filter(|d| !d.as_os_str().is_empty()) {
+            candidates.push(base.join(file));
+            dir = base.parent();
+        }
+    }
+    candidates.push(file.to_path_buf());
     candidates.into_iter().find(|path| path.is_file())
 }
 
@@ -98,4 +106,27 @@ pub fn render(stop: &Value, style: &Style) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn prefers_the_programs_crate_over_the_clients_directory() {
+        let root = std::env::temp_dir().join(format!("peephole-view-{}", std::process::id()));
+        let program = root.join("workspace/member");
+        std::fs::create_dir_all(program.join("src")).unwrap();
+        std::fs::write(program.join("src/main.rs"), "fn main() {}\n").unwrap();
+        // `file!()` is relative to the workspace root here.
+        let stop = json!({"file": "member/src/main.rs", "manifest_dir": program, "cwd": "/"});
+        assert_eq!(
+            source(&stop),
+            Some(root.join("workspace/member/src/main.rs"))
+        );
+        let stop = json!({"file": "src/main.rs", "manifest_dir": program, "cwd": "/"});
+        assert_eq!(source(&stop), Some(program.join("src/main.rs")));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

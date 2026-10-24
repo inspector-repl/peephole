@@ -266,6 +266,9 @@ pub fn run() -> io::Result<i32> {
             continue;
         };
         let stop = message.get("stop").cloned().unwrap_or_default();
+        // Keys typed while waiting were meant for something else.
+        // SAFETY: plain syscall on stdin.
+        unsafe { libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH) };
         print!("{}", view::render(&stop, &style));
         {
             let mut current = program.borrow_mut();

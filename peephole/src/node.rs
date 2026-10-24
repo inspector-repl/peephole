@@ -24,6 +24,8 @@ pub struct Shared {
 #[derive(Clone)]
 pub struct Node {
     ptr: *mut dyn PartialReflect,
+    /// False for values `inspect!` got as `&`, which must never be written.
+    writable: bool,
     /// The generation it was created in, `None` for values that never
     /// move, like the program's locals.
     born: Option<u64>,
@@ -32,12 +34,19 @@ pub struct Node {
 
 impl Node {
     /// # Safety
-    /// `value` must outlive every clone of the node. The session drops all
-    /// nodes before `inspect!` returns.
-    pub unsafe fn new(value: &mut dyn PartialReflect, shared: &Rc<Shared>) -> Self {
+    /// `ptr` must stay valid while any clone of the node exists, and come
+    /// from a `&mut` if `writable`. The session drops all nodes before
+    /// `inspect!` returns.
+    unsafe fn from_raw(
+        ptr: *mut dyn PartialReflect,
+        writable: bool,
+        born: Option<u64>,
+        shared: &Rc<Shared>,
+    ) -> Self {
         Self {
-            ptr: std::ptr::from_mut(value),
-            born: Some(shared.generation.get()),
+            ptr,
+            writable,
+            born,
             shared: Rc::clone(shared),
         }
     }
@@ -45,16 +54,22 @@ impl Node {
     /// A node for a value whose address never changes during the stop.
     ///
     /// # Safety
-    /// As for [`Node::new`].
+    /// See [`Node::from_raw`].
     pub unsafe fn root(value: &mut dyn PartialReflect, shared: &Rc<Shared>) -> Self {
-        Self {
-            born: None,
-            // SAFETY: forwarded to the caller.
-            ..unsafe { Self::new(value, shared) }
-        }
+        // SAFETY: forwarded to the caller.
+        unsafe { Self::from_raw(std::ptr::from_mut(value), true, None, shared) }
     }
 
-    pub fn get(&mut self) -> Res<&mut dyn PartialReflect> {
+    /// A read-only node for a value whose address never changes.
+    ///
+    /// # Safety
+    /// See [`Node::from_raw`].
+    pub unsafe fn root_shared(value: &dyn PartialReflect, shared: &Rc<Shared>) -> Self {
+        // SAFETY: forwarded to the caller, and `writable` is false.
+        unsafe { Self::from_raw(std::ptr::from_ref(value).cast_mut(), false, None, shared) }
+    }
+
+    fn check(&self) -> Res<()> {
         if self
             .born
             .is_some_and(|born| born != self.shared.generation.get())
@@ -65,10 +80,66 @@ impl Node {
                     .into(),
             );
         }
-        // SAFETY: valid per `new`, and no write since `born` moved it.
+        Ok(())
+    }
+
+    pub fn get(&mut self) -> Res<&dyn PartialReflect> {
+        self.check()?;
+        // SAFETY: valid per `from_raw`, and no write since `born` moved it.
+        Ok(unsafe { &*self.ptr })
+    }
+
+    pub fn get_mut(&mut self) -> Res<&mut dyn PartialReflect> {
+        self.check()?;
+        if !self.writable {
+            return Err("read-only: pass the variable to inspect! as `mut` to change it".into());
+        }
+        // SAFETY: as in `get`, and the pointer came from a `&mut`.
         Ok(unsafe { &mut *self.ptr })
     }
+
+    /// A node for `value`, which lives inside this node's value.
+    fn child(&self, value: *mut dyn PartialReflect) -> Dynamic {
+        // SAFETY: values reachable from a node live as long as the node.
+        // Children of read-only nodes stay read-only.
+        present(unsafe {
+            Self::from_raw(
+                value,
+                self.writable,
+                Some(self.shared.generation.get()),
+                &self.shared,
+            )
+        })
+    }
 }
+
+fn is_option(value: &dyn PartialReflect) -> bool {
+    value
+        .reflect_type_path()
+        .starts_with("core::option::Option<")
+}
+
+/// How scripts see a node: leaves as Rhai values, `Some(x)` as `x` and
+/// `None` as `()`, everything else as the node itself.
+pub fn present(mut node: Node) -> Dynamic {
+    let Ok(value) = node.get() else {
+        return Dynamic::from(node);
+    };
+    if let Some(leaf) = leaf(value) {
+        return leaf;
+    }
+    if is_option(value)
+        && let ReflectRef::Enum(option) = value.reflect_ref()
+    {
+        if option.variant_name() == "None" {
+            return Dynamic::UNIT;
+        }
+        return step(&mut node, &Step::Index(0)).unwrap_or(Dynamic::UNIT);
+    }
+    Dynamic::from(node)
+}
+
+impl Node {}
 
 macro_rules! leaf_to_dynamic {
     ($value:expr; lossless: $($small:ty),*; checked: $($big:ty),*) => {
@@ -106,22 +177,28 @@ pub fn leaf(value: &dyn PartialReflect) -> Option<Dynamic> {
     None
 }
 
+/// A node for memory an exposed function returned a `&mut` to.
+fn keep_borrowed(value: &mut dyn PartialReflect, shared: &Rc<Shared>) -> Dynamic {
+    // SAFETY: the function borrowed from a node argument, so the memory
+    // belongs to the program. It may move, so the node is not a root.
+    let node = unsafe {
+        Node::from_raw(
+            std::ptr::from_mut(value),
+            true,
+            Some(shared.generation.get()),
+            shared,
+        )
+    };
+    present(node)
+}
+
 /// Keeps a value returned by an exposed function alive for the stop.
 fn keep(value: Box<dyn PartialReflect>, shared: &Rc<Shared>) -> Dynamic {
     let mut owned = shared.owned.borrow_mut();
     owned.push(value);
     let value = owned.last_mut().expect("just pushed");
     // SAFETY: the box keeps its address until the stop ends.
-    leaf(value.as_ref())
-        .unwrap_or_else(|| Dynamic::from(unsafe { Node::root(value.as_mut(), shared) }))
-}
-
-/// Leaves become Rhai values, everything else stays a live node.
-pub fn wrap(value: &mut dyn PartialReflect, shared: &Rc<Shared>) -> Dynamic {
-    leaf(value).unwrap_or_else(|| {
-        // SAFETY: values reachable from a node live as long as the node.
-        Dynamic::from(unsafe { Node::new(value, shared) })
-    })
+    present(unsafe { Node::root(value.as_mut(), shared) })
 }
 
 macro_rules! assign_int {
@@ -143,8 +220,36 @@ fn float_from_int(value: &Dynamic) -> Option<f64> {
     i32::try_from(value.as_int().ok()?).ok().map(f64::from)
 }
 
+/// `()` becomes `None`, anything else `Some(value)`.
+fn assign_option(target: &mut dyn PartialReflect, value: &Dynamic, shared: &Shared) -> Res<()> {
+    use bevy_reflect::TypeInfo;
+    use bevy_reflect::enums::{DynamicEnum, DynamicVariant};
+    use bevy_reflect::tuple::DynamicTuple;
+    let option = if value.is_unit() {
+        DynamicEnum::new("None", DynamicVariant::Unit)
+    } else {
+        let Some(TypeInfo::Enum(info)) = target.get_represented_type_info() else {
+            return Err("unknown Option type".into());
+        };
+        let inner = info
+            .variant("Some")
+            .and_then(|variant| variant.as_tuple_variant().ok())
+            .and_then(|variant| variant.field_at(0))
+            .ok_or("unknown Option type")?;
+        let mut tuple = DynamicTuple::default();
+        tuple.insert_boxed(to_owned(value, inner.type_id(), inner.type_path())?);
+        DynamicEnum::new("Some", DynamicVariant::Tuple(tuple))
+    };
+    target.try_apply(&option).map_err(|err| err.to_string())?;
+    shared.generation.set(shared.generation.get() + 1);
+    Ok(())
+}
+
 /// Writes `value` into `target`.
 fn assign(target: &mut dyn PartialReflect, value: &Dynamic, shared: &Shared) -> Res<()> {
+    if is_option(target) && !value.is::<Node>() {
+        return assign_option(target, value, shared);
+    }
     if let Some(mut source) = value.clone().try_cast::<Node>() {
         if std::ptr::addr_eq(source.ptr, std::ptr::from_mut(target)) {
             return Ok(()); // Rhai writes nested results back to their parent.
@@ -195,7 +300,7 @@ fn assign(target: &mut dyn PartialReflect, value: &Dynamic, shared: &Shared) -> 
 /// Writes `value` into the program variable behind `node`.
 pub fn store(node: &mut Node, value: &Dynamic) -> Res<()> {
     let shared = Rc::clone(&node.shared);
-    assign(node.get()?, value, &shared)
+    assign(node.get_mut()?, value, &shared)
 }
 
 /// Names reachable with `.name`, with their type.
@@ -252,26 +357,21 @@ fn distance(left: &str, right: &str) -> usize {
     row[right.len()]
 }
 
-fn member<'a>(value: &'a mut dyn PartialReflect, name: &str) -> Res<&'a mut dyn PartialReflect> {
-    let type_name = value.reflect_short_type_path().to_owned();
-    let found: Option<*mut dyn PartialReflect> = match value.reflect_mut() {
-        ReflectMut::Struct(s) => s.field_mut(name).map(std::ptr::from_mut),
-        ReflectMut::Enum(e) => e.field_mut(name).map(std::ptr::from_mut),
-        ReflectMut::Map(m) => m.get_mut(&name.to_owned()).map(std::ptr::from_mut),
-        _ => None,
-    };
-    match found {
-        // SAFETY: points into `value`, which stays borrowed for 'a.
-        Some(ptr) => Ok(unsafe { &mut *ptr }),
-        None => Err(format!(
-            "no field `{name}` on {type_name}{}",
-            did_you_mean(name, value)
-        )
-        .into()),
-    }
+pub enum Step<'s> {
+    Member(&'s str),
+    Index(i64),
 }
 
-fn element(value: &mut dyn PartialReflect, index: i64) -> Res<&mut dyn PartialReflect> {
+fn no_member(value: &dyn PartialReflect, name: &str) -> String {
+    format!(
+        "no field `{name}` on {}{}",
+        value.reflect_short_type_path(),
+        did_you_mean(name, value)
+    )
+}
+
+/// The position of `index` in `value`, negative counting from the end.
+fn position(value: &dyn PartialReflect, index: i64) -> Res<usize> {
     let len = match value.reflect_ref() {
         ReflectRef::List(l) => l.len(),
         ReflectRef::Array(a) => a.len(),
@@ -280,68 +380,134 @@ fn element(value: &mut dyn PartialReflect, index: i64) -> Res<&mut dyn PartialRe
         ReflectRef::Enum(e) => e.field_len(),
         _ => return Err(format!("{} cannot be indexed", value.reflect_short_type_path()).into()),
     };
-    let resolved = if index < 0 {
-        len.checked_sub(index.unsigned_abs().try_into().unwrap_or(usize::MAX))
+    let at = if index < 0 {
+        usize::try_from(index.unsigned_abs())
+            .ok()
+            .and_then(|back| len.checked_sub(back))
     } else {
         usize::try_from(index).ok()
     };
-    let Some(at) = resolved.filter(|at| *at < len) else {
-        return Err(format!("index {index} is out of bounds for length {len}").into());
+    at.filter(|at| *at < len)
+        .ok_or_else(|| format!("index {index} is out of bounds for length {len}").into())
+}
+
+fn locate<'a>(value: &'a dyn PartialReflect, step: &Step<'_>) -> Res<&'a dyn PartialReflect> {
+    let found = match *step {
+        Step::Member(name) => match value.reflect_ref() {
+            ReflectRef::Struct(s) => s.field(name),
+            ReflectRef::Enum(e) => e.field(name),
+            ReflectRef::Map(m) => m.get(&name.to_owned()),
+            _ => None,
+        }
+        .ok_or_else(|| no_member(value, name))?,
+        Step::Index(index) => {
+            let at = position(value, index)?;
+            match value.reflect_ref() {
+                ReflectRef::List(l) => l.get(at),
+                ReflectRef::Array(a) => a.get(at),
+                ReflectRef::Tuple(t) => t.field(at),
+                ReflectRef::TupleStruct(t) => t.field(at),
+                ReflectRef::Enum(e) => e.field_at(at),
+                _ => None,
+            }
+            .ok_or("index out of bounds")?
+        }
     };
-    let found = match value.reflect_mut() {
-        ReflectMut::List(l) => l.get_mut(at),
-        ReflectMut::Array(a) => a.get_mut(at),
-        ReflectMut::Tuple(t) => t.field_mut(at),
-        ReflectMut::TupleStruct(t) => t.field_mut(at),
-        ReflectMut::Enum(e) => e.field_at_mut(at),
-        _ => None,
+    Ok(found)
+}
+
+fn locate_mut<'a>(
+    value: &'a mut dyn PartialReflect,
+    step: &Step<'_>,
+) -> Res<&'a mut dyn PartialReflect> {
+    // Checked on the shared path first, so errors don't need a second borrow.
+    locate(value, step)?;
+    let found = match *step {
+        Step::Member(name) => match value.reflect_mut() {
+            ReflectMut::Struct(s) => s.field_mut(name),
+            ReflectMut::Enum(e) => e.field_mut(name),
+            ReflectMut::Map(m) => m.get_mut(&name.to_owned()),
+            _ => None,
+        },
+        Step::Index(index) => {
+            let at = position(value, index)?;
+            match value.reflect_mut() {
+                ReflectMut::List(l) => l.get_mut(at),
+                ReflectMut::Array(a) => a.get_mut(at),
+                ReflectMut::Tuple(t) => t.field_mut(at),
+                ReflectMut::TupleStruct(t) => t.field_mut(at),
+                ReflectMut::Enum(e) => e.field_at_mut(at),
+                _ => None,
+            }
+        }
     };
-    found.ok_or_else(|| "index out of bounds".into())
+    found.ok_or_else(|| "not found".into())
+}
+
+/// The value one `step` below `node`, live and as writable as `node`.
+pub fn step(node: &mut Node, step: &Step<'_>) -> Res<Dynamic> {
+    let ptr = if node.writable {
+        std::ptr::from_mut(locate_mut(node.get_mut()?, step)?)
+    } else {
+        std::ptr::from_ref(locate(node.get()?, step)?).cast_mut()
+    };
+    Ok(node.child(ptr))
+}
+
+pub fn get_member(node: &mut Node, name: &str) -> Res<Dynamic> {
+    step(node, &Step::Member(name))
+}
+
+pub fn get_element(node: &mut Node, index: i64) -> Res<Dynamic> {
+    step(node, &Step::Index(index))
+}
+
+fn set(node: &mut Node, step: &Step<'_>, value: &Dynamic) -> Res<()> {
+    if let Some(source) = value.clone().try_cast::<Node>() {
+        let target = locate(node.get()?, step)?;
+        if std::ptr::addr_eq(source.ptr, std::ptr::from_ref(target)) {
+            return Ok(()); // Rhai writes nested results back to their parent.
+        }
+    }
+    let shared = Rc::clone(&node.shared);
+    assign(locate_mut(node.get_mut()?, step)?, value, &shared)
 }
 
 /// The elements of a list-like value, or the values of a map.
 pub fn elements(node: &mut Node) -> Res<Vec<Dynamic>> {
-    let shared = Rc::clone(&node.shared);
     let value = node.get()?;
-    let mut out = Vec::new();
-    match value.reflect_mut() {
-        ReflectMut::List(l) => {
-            for i in 0..l.len() {
-                out.extend(l.get_mut(i).map(|v| wrap(v, &shared)));
-            }
-        }
-        ReflectMut::Array(a) => {
-            for i in 0..a.len() {
-                out.extend(a.get_mut(i).map(|v| wrap(v, &shared)));
-            }
-        }
-        ReflectMut::Map(m) => {
+    let count = match value.reflect_ref() {
+        ReflectRef::List(l) => l.len(),
+        ReflectRef::Array(a) => a.len(),
+        ReflectRef::Set(s) => return Ok(s.iter().filter_map(leaf).collect()),
+        ReflectRef::Map(m) => {
             let keys: Vec<Box<dyn PartialReflect>> = m
                 .iter()
                 .filter_map(|(key, _)| key.to_dynamic().ok())
                 .collect();
+            let mut out = Vec::new();
             for key in keys {
-                out.extend(m.get_mut(key.as_ref()).map(|v| wrap(v, &shared)));
+                let ptr = if node.writable {
+                    let ReflectMut::Map(m) = node.get_mut()?.reflect_mut() else {
+                        unreachable!()
+                    };
+                    m.get_mut(key.as_ref()).map(std::ptr::from_mut)
+                } else {
+                    let ReflectRef::Map(m) = node.get()?.reflect_ref() else {
+                        unreachable!()
+                    };
+                    m.get(key.as_ref())
+                        .map(|v| std::ptr::from_ref(v).cast_mut())
+                };
+                out.extend(ptr.map(|ptr| node.child(ptr)));
             }
-        }
-        ReflectMut::Set(s) => {
-            out.extend(s.iter().filter_map(leaf));
+            return Ok(out);
         }
         _ => return Err(format!("{} is not a collection", value.reflect_short_type_path()).into()),
-    }
-    Ok(out)
-}
-
-pub fn get_member(node: &mut Node, name: &str) -> Res<Dynamic> {
-    let shared = Rc::clone(&node.shared);
-    let value = member(node.get()?, name)?;
-    Ok(wrap(value, &shared))
-}
-
-pub fn get_element(node: &mut Node, index: i64) -> Res<Dynamic> {
-    let shared = Rc::clone(&node.shared);
-    let value = element(node.get()?, index)?;
-    Ok(wrap(value, &shared))
+    };
+    (0..count)
+        .map(|i| get_element(node, i64::try_from(i).unwrap_or(i64::MAX)))
+        .collect()
 }
 
 fn len(node: &mut Node) -> Res<i64> {
@@ -439,7 +605,7 @@ fn call(
     for ((info, arg), node) in signature.args().iter().zip(args).zip(&mut nodes) {
         match (info.ownership(), node) {
             (Ownership::Ref, Some(node)) => list.push_ref(node.get()?),
-            (Ownership::Mut, Some(node)) => list.push_mut(node.get()?),
+            (Ownership::Mut, Some(node)) => list.push_mut(node.get_mut()?),
             (Ownership::Owned, _) => {
                 list.push_boxed(to_owned(arg, info.type_id(), info.type_path())?);
             }
@@ -458,7 +624,7 @@ fn call(
     Ok(
         match (function.call(list).map_err(|err| err.to_string())?, &shared) {
             (Return::Owned(value), Some(shared)) => keep(value, shared),
-            (Return::Mut(value), Some(shared)) => wrap(value, shared),
+            (Return::Mut(value), Some(shared)) => keep_borrowed(value, shared),
             (Return::Owned(value), None) => copy(value.as_ref()),
             (Return::Ref(value), _) => copy(value),
             (Return::Mut(value), None) => copy(value),
@@ -486,16 +652,14 @@ fn filter(context: &NativeCallContext, node: &mut Node, function: &FnPtr) -> Res
 /// Registers `Node` and every exposed function with `engine`.
 pub fn register(engine: &mut Engine) {
     engine
-        .register_type_with_name::<Node>("Node")
+        .register_type_with_name::<Node>("value")
         .register_indexer_get(get_member)
         .register_indexer_get(get_element)
         .register_indexer_set(|node: &mut Node, name: &str, value: Dynamic| {
-            let shared = Rc::clone(&node.shared);
-            assign(member(node.get()?, name)?, &value, &shared)
+            set(node, &Step::Member(name), &value)
         })
         .register_indexer_set(|node: &mut Node, index: i64, value: Dynamic| {
-            let shared = Rc::clone(&node.shared);
-            assign(element(node.get()?, index)?, &value, &shared)
+            set(node, &Step::Index(index), &value)
         })
         .register_iterator::<Node>()
         .register_fn("len", len)

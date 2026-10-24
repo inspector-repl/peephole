@@ -3,12 +3,14 @@
 Stop a running Rust program and explore its variables from a REPL.
 
 ```rust
+use peephole::bevy_reflect;
+
 #[derive(peephole::Reflect)]
 struct Order { id: u64, items: Vec<Item>, status: Status }
 
 fn checkout(order: &mut Order) {
     let mut retries = 3;
-    peephole::inspect!(*order, retries);
+    peephole::inspect!(mut *order, retries);
 }
 ```
 
@@ -18,7 +20,7 @@ waiting for a program to reach peephole::inspect!(…)
 stopped at src/main.rs:42 in shop::checkout · pid 4711 · thread main
    40 │ fn checkout(order: &mut Order) {
    41 │     let mut retries = 3;
-▶  42 │     peephole::inspect!(*order, retries);
+▶  42 │     peephole::inspect!(mut *order, retries);
    43 │ }
 locals:
   order    Order  Order { id: 7, items: [Item { name: "apple", qty: 3, price:…
@@ -44,9 +46,31 @@ Add the library and derive `Reflect` on the types you want to look at:
 peephole = "0.1"
 ```
 
-`inspect!(a, b)` stops only while a `peephole` REPL listens. Otherwise it
-returns at once, so it can stay in debug builds. Owned locals need a `mut`
-binding. Pass `&mut` parameters dereferenced: `inspect!(*order)`.
+The derive refers to `bevy_reflect` by name, so each module that derives
+needs `use peephole::bevy_reflect;`. If a `build.rs` includes those
+modules, add peephole to `[build-dependencies]` too.
+
+`inspect!` stops only while a `peephole` REPL listens. Otherwise it
+returns at once, so it can stay in debug builds. Variables are read-only
+unless marked `mut`:
+
+```rust
+fn handle(device: &Device, dir: &Path, counter: &mut u32, name: &str) {
+    let mut retries = 3;
+    peephole::inspect!(
+        device,                  // read-only, also through `&T`
+        mut *counter,            // writable `&mut` parameter
+        mut retries,             // writable local, needs a `mut` binding
+        dir = dir.to_path_buf(), // any expression, under a name
+        name,                    // `&str` is shown as a read-only copy
+    );
+}
+```
+
+Fields of foreign types that don't implement `Reflect` need
+`#[reflect(ignore)]`. If their fields are public, bevy_reflect's
+[`reflect_remote`](https://docs.rs/bevy_reflect/latest/bevy_reflect/attr.reflect_remote.html)
+can mirror them instead.
 
 Functions and methods become callable after `expose`:
 
@@ -69,6 +93,9 @@ grey hint shows its current value.
 | `.quit`, `.q`, Ctrl-D | resume the program and exit |
 | `.where`, `.w` | show the stop again |
 | Ctrl-C | clear the line, or interrupt running input |
+
+`Option` fields read as their value, or `None` as `()`. Assigning a value
+stores `Some(value)`, assigning `()` stores `None`.
 
 Besides Rhai's core, logic, string, list and math functions, values from
 the program support `len()`, `keys()`, `variant()`, `type_name()`,

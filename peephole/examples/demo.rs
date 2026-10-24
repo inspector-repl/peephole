@@ -17,8 +17,14 @@ pub enum Status {
 }
 
 #[derive(Reflect, Debug)]
+pub struct Event {
+    pub status: Status,
+}
+
+#[derive(Reflect, Debug)]
 pub struct Order {
     pub id: u64,
+    pub coupon: Option<String>,
     pub items: Vec<Item>,
     pub status: Status,
     secret: String,
@@ -31,14 +37,25 @@ impl Order {
 }
 
 fn checkout(order: &mut Order, attempts: &mut u32) {
-    let mut names: HashMap<String, i64> = [("alice".into(), 1), ("bob".into(), 2)].into();
-    peephole::inspect!(*order, names, *attempts);
+    let names: HashMap<String, i64> = [("alice".into(), 1), ("bob".into(), 2)].into();
+    let history = vec![
+        Event {
+            status: Status::Pending,
+        },
+        Event {
+            status: Status::Shipped {
+                tracking: "OLD1".into(),
+            },
+        },
+    ];
+    peephole::inspect!(mut *order, names, mut *attempts, history);
 }
 
 fn main() {
     peephole::expose("total", Order::total);
     let mut order = Order {
         id: 7,
+        coupon: None,
         items: vec![
             Item {
                 name: "apple".into(),
@@ -62,9 +79,10 @@ fn main() {
     }
     checkout(&mut order, &mut attempts);
     println!(
-        "qty={} attempts={} total={}",
+        "qty={} attempts={} total={} coupon={:?}",
         order.items[0].qty,
         attempts,
-        order.total()
+        order.total(),
+        order.coupon
     );
 }
