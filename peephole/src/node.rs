@@ -178,11 +178,26 @@ fn keep(value: Box<dyn PartialReflect>, shared: &Rc<Shared>) -> Dynamic {
 }
 
 fn mismatch(value: &Dynamic, target: &str) -> String {
-    format!(
-        "cannot assign {} to {}",
-        value.type_name(),
-        render::short_type(target)
-    )
+    let source = match value.clone().try_cast::<Node>() {
+        Some(mut node) => node.get().map_or_else(
+            |_| "value".to_owned(),
+            |v| render::short_type(v.reflect_type_path()),
+        ),
+        None => value.type_name().to_owned(),
+    };
+    format!("cannot assign {source} to {}", render::short_type(target))
+}
+
+/// `other` is read as a value of the node's type, as in assignments.
+fn equals(node: &mut Node, other: &Dynamic) -> Res<bool> {
+    let value = node.get()?;
+    let Some(info) = value.get_represented_type_info() else {
+        return Ok(false);
+    };
+    Ok(compose(other, info)
+        .ok()
+        .and_then(|other| value.reflect_partial_eq(other.as_ref()))
+        .unwrap_or(false))
 }
 
 /// Integer literals beyond `i64` parse as floats.
@@ -420,9 +435,16 @@ fn assign(target: &mut dyn PartialReflect, source: &dyn PartialReflect) -> Res<(
         }
         return Ok(());
     }
-    target
-        .try_apply(source)
-        .map_err(|err| err.to_string().into())
+    target.try_apply(source).map_err(|err| match err {
+        bevy_reflect::ApplyError::MismatchedKinds { .. }
+        | bevy_reflect::ApplyError::MismatchedTypes { .. } => format!(
+            "cannot assign {} to {}",
+            render::short_type(source.reflect_type_path()),
+            render::short_type(target.reflect_type_path())
+        )
+        .into(),
+        other => other.to_string().into(),
+    })
 }
 
 /// `()` as `None`, anything else as `Some(value)`.
@@ -801,6 +823,19 @@ pub fn register(engine: &mut Engine) {
             set(node, &Step::Index(index), &value)
         })
         .register_iterator::<Node>()
+        // By value: `&mut` first arguments make Rhai write the operand back.
+        .register_fn("==", |mut node: Node, other: Dynamic| {
+            equals(&mut node, &other)
+        })
+        .register_fn("!=", |mut node: Node, other: Dynamic| {
+            equals(&mut node, &other).map(|eq| !eq)
+        })
+        .register_fn("==", |other: Dynamic, mut node: Node| {
+            equals(&mut node, &other)
+        })
+        .register_fn("!=", |other: Dynamic, mut node: Node| {
+            equals(&mut node, &other).map(|eq| !eq)
+        })
         .register_fn("len", len)
         .register_fn("to_array", |node: &mut Node| elements(node))
         .register_fn(

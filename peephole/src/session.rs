@@ -15,6 +15,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 const PREVIEW_WIDTH: usize = 60;
+const MAX_OUTPUT_LINES: usize = 1000;
 const RETRY: Duration = Duration::from_millis(100);
 /// Operations between checks for an interrupt from the client.
 const CHECK_EVERY: u64 = 1 << 12;
@@ -31,8 +32,21 @@ pub struct Session {
     pub scope: Scope<'static>,
     pub variables: Vec<Variable>,
     output: Rc<RefCell<String>>,
+    /// Functions defined by earlier input.
+    functions: rhai::AST,
     // Dropped last, nodes in `scope` point into memory it owns.
     _shared: Rc<Shared>,
+}
+
+/// Keeps a runaway `print` loop from flooding the terminal.
+fn emit(output: &RefCell<String>, text: &str) {
+    let mut output = output.borrow_mut();
+    let lines = output.lines().count();
+    if lines < MAX_OUTPUT_LINES {
+        writeln!(output, "{text}").unwrap_or_default();
+    } else if lines == MAX_OUTPUT_LINES {
+        output.push_str("… more output left out\n");
+    }
 }
 
 fn engine(output: &Rc<RefCell<String>>) -> Engine {
@@ -47,10 +61,9 @@ fn engine(output: &Rc<RefCell<String>>) -> Engine {
         engine.register_global_module(package);
     }
     let printed = Rc::clone(output);
-    engine.on_print(move |text| writeln!(printed.borrow_mut(), "{text}").unwrap_or_default());
+    engine.on_print(move |text| emit(&printed, text));
     let debugged = Rc::clone(output);
-    engine
-        .on_debug(move |text, _, _| writeln!(debugged.borrow_mut(), "{text}").unwrap_or_default());
+    engine.on_debug(move |text, _, _| emit(&debugged, text));
     node::register(&mut engine);
     engine
 }
@@ -84,6 +97,7 @@ impl Session {
             scope,
             variables,
             output,
+            functions: rhai::AST::empty(),
             _shared: shared,
         }
     }
@@ -123,23 +137,22 @@ impl Session {
             let Some(current) = self.scope.get_value::<Dynamic>(var.name) else {
                 continue;
             };
-            let before = match node::leaf(var.node.get()?) {
-                Some(leaf)
-                    if leaf.type_name() == current.type_name()
-                        && leaf.to_string() == current.to_string() =>
-                {
-                    continue;
+            // What the scope held before the input ran.
+            let before = node::present(var.node.clone());
+            let unchanged = match (
+                before.clone().try_cast::<Node>(),
+                current.clone().try_cast::<Node>(),
+            ) {
+                (Some(old), Some(new)) => old.same(&new),
+                (None, None) => {
+                    before.type_name() == current.type_name()
+                        && before.to_string() == current.to_string()
                 }
-                Some(leaf) => leaf,
-                None if current
-                    .clone()
-                    .try_cast::<Node>()
-                    .is_some_and(|n| n.same(&var.node)) =>
-                {
-                    continue;
-                }
-                None => node::present(var.node.clone()),
+                _ => false,
             };
+            if unchanged {
+                continue;
+            }
             if let Err(err) = node::store(&mut var.node, &current) {
                 self.scope.set_value(var.name, before);
                 return Err(err);
@@ -167,8 +180,22 @@ impl Session {
         self.output.borrow_mut().clear();
         let result = self
             .engine
-            .eval_with_scope::<Dynamic>(&mut self.scope, code)
-            .and_then(|value| self.store_variables().map(|()| value));
+            .compile_with_scope(&self.scope, code)
+            .map_err(Into::into)
+            .and_then(|ast| {
+                let value = self
+                    .engine
+                    .eval_ast_with_scope::<Dynamic>(&mut self.scope, &self.functions.merge(&ast))?;
+                // Functions stay defined for later input, like variables.
+                self.functions = self.functions.merge(&ast.clone_functions_only());
+                Ok(value)
+            })
+            .and_then(|value| {
+                if let Some(mut node) = value.clone().try_cast::<Node>() {
+                    node.get()?;
+                }
+                self.store_variables().map(|()| value)
+            });
         let output = std::mem::take(&mut *self.output.borrow_mut());
         match result {
             Ok(value) => {
@@ -184,6 +211,12 @@ impl Session {
                 let line = err.position().line().filter(|_| code.contains('\n'));
                 let mut text = match *err {
                     EvalAltResult::ErrorTerminated(..) => "interrupted".to_owned(),
+                    EvalAltResult::ErrorFunctionNotFound(ref signature, _)
+                        if signature.contains("(()") =>
+                    {
+                        let name = signature.split(' ').next().unwrap_or_default();
+                        format!("`{name}` was called on `()`, which is how None reads")
+                    }
                     EvalAltResult::ErrorFunctionNotFound(ref signature, _)
                         if signature.contains("(value") =>
                     {
@@ -293,6 +326,56 @@ mod tests {
         qty: u32,
         tags: Vec<String>,
         size: (u8, u8),
+    }
+
+    #[test]
+    fn compares_and_remembers() {
+        let mut status = Status::Shipped {
+            tracking: "XY".into(),
+        };
+        let other = Status::Pending;
+        let mut items = vec![Status::Pending, Status::Pending];
+        let coupon: Option<String> = None;
+        let mut locals = [
+            Local::writable("status", &mut status),
+            Local::shared("other", &other),
+            Local::writable("items", &mut items),
+            Local::shared("coupon", &coupon),
+        ];
+        let mut session = Session::new(&mut locals);
+        let mut value = |code: &str| {
+            let reply = session.evaluate(code);
+            assert_eq!(reply["error"], false, "{code}: {reply}");
+            reply["value"].as_str().unwrap().to_owned()
+        };
+        assert_eq!(value("items[0] == items[1]"), "true");
+        assert_eq!(value("items[0] != status"), "true");
+        assert_eq!(value("other == \"Pending\""), "true");
+        assert_eq!(value("\"Pending\" == other"), "true");
+        assert_eq!(value(r#"status == #{Shipped: #{tracking: "XY"}}"#), "true");
+        assert_eq!(value("status == 1"), "false");
+        value("fn twice(x) { x * 2 }");
+        assert_eq!(value("twice(2)"), "4");
+        value("let a = items[0]; items = []");
+        let output = session.evaluate("for x in range(0, 5000) { print(x) }");
+        assert!(output["output"].as_str().unwrap().lines().count() < 1100);
+
+        assert_eq!(
+            error(&mut session, "status = items"),
+            "cannot assign Vec<Status> to Status"
+        );
+        assert_eq!(
+            error(&mut session, "items = other"),
+            "cannot assign Status to Vec<Status>"
+        );
+        assert_eq!(
+            error(&mut session, "a"),
+            "stale reference: a later assignment may have moved this value. Evaluate the expression again."
+        );
+        assert_eq!(
+            error(&mut session, "coupon.len()"),
+            "`len` was called on `()`, which is how None reads"
+        );
     }
 
     #[test]
