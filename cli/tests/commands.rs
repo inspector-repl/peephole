@@ -201,7 +201,22 @@ fn completes_and_previews() {
     let program = state.program();
     let mut conn = Connection::new(listener.accept().unwrap().0).unwrap();
     let stop = conn.receive().unwrap().unwrap();
-    assert_eq!(stop["stop"]["locals"][1]["type"], "HashMap<String, i64>");
+    let locals: Vec<(&str, &str)> = stop["stop"]["locals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| (l["name"].as_str().unwrap(), l["type"].as_str().unwrap()))
+        .collect();
+    // Found by #[peephole::scope]: parameters first, then lets.
+    assert_eq!(
+        locals,
+        [
+            ("order", "Order"),
+            ("attempts", "u32"),
+            ("names", "HashMap<String, i64>"),
+            ("history", "Vec<Event>"),
+        ]
+    );
 
     let reply = conn
         .request(&json!({"complete": "let x = order.items[0].q"}))

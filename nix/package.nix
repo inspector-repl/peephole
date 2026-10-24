@@ -10,6 +10,7 @@ rustPlatform.buildRustPackage {
       ../Cargo.toml
       ../Cargo.lock
       ../protocol
+      ../macros
       ../peephole
       ../cli
     ];

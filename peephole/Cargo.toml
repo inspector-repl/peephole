@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 peephole-protocol.workspace = true
+peephole-macros.workspace = true
 serde_json.workspace = true
 bevy_reflect = { version = "0.20", default-features = false, features = ["std", "functions"] }
 # Only the core, logic, string, list and math packages are loaded.

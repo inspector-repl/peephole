@@ -36,6 +36,7 @@ impl Order {
     }
 }
 
+#[peephole::scope]
 fn checkout(order: &mut Order, attempts: &mut u32) {
     let names: HashMap<String, i64> = [("alice".into(), 1), ("bob".into(), 2)].into();
     let history = vec![
@@ -48,7 +49,7 @@ fn checkout(order: &mut Order, attempts: &mut u32) {
             },
         },
     ];
-    peephole::inspect!(mut *order, names, mut *attempts, history);
+    peephole::inspect!();
 }
 
 fn main() {

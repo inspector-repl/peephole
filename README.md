@@ -67,6 +67,34 @@ fn handle(device: &Device, dir: &Path, counter: &mut u32, name: &str) {
 }
 ```
 
+### Finding the variables automatically
+
+With `#[peephole::scope]` on the function, an empty `inspect!()` lists
+every variable in scope at that point:
+
+```rust
+#[peephole::scope]
+fn checkout(order: &mut Order, attempts: &mut u32) {
+    let names = load_names();
+    peephole::inspect!(); // inspect!(mut *order, mut *attempts, names)
+}
+```
+
+`let mut` bindings and `&mut` parameters become writable. Variables
+without `Reflect` show as `<no Reflect>`. Inside a loop or `match`, the
+variables its head expression uses are left out, since the loop or match
+may hold a borrow of them. Closures and async blocks only list their own
+variables.
+
+The attribute sees syntax, not types, so two cases need help:
+
+- A value moved earlier, as in `drop(v)`, fails with "borrow of moved
+  value". Leave it out with `inspect!(!v)`.
+- Types holding borrowed data, like `Vec<&str>`, fail with "borrowed
+  data escapes". Leave them out the same way.
+
+An explicit list, `inspect!(a, mut b)`, is never changed.
+
 Fields of foreign types that don't implement `Reflect` need
 `#[reflect(ignore)]`. If their fields are public, bevy_reflect's
 [`reflect_remote`](https://docs.rs/bevy_reflect/latest/bevy_reflect/attr.reflect_remote.html)

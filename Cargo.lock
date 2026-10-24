@@ -516,6 +516,7 @@ name = "peephole"
 version = "0.1.0"
 dependencies = [
  "bevy_reflect",
+ "peephole-macros",
  "peephole-protocol",
  "rhai",
  "serde_json",
@@ -529,6 +530,15 @@ dependencies = [
  "peephole-protocol",
  "rustyline",
  "serde_json",
+]
+
+[[package]]
+name = "peephole-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]

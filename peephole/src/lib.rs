@@ -18,6 +18,7 @@ mod render;
 mod session;
 
 pub use bevy_reflect::{self, Reflect};
+pub use peephole_macros::scope;
 
 use bevy_reflect::func::{DynamicFunction, IntoFunction};
 use std::sync::Mutex;
@@ -71,7 +72,7 @@ impl<'a> Local<'a> {
 }
 
 // Autoref specialization: method lookup tries the most `&`s first, so
-// `&str` beats `&&T`, which beats `&T`/`&mut T`.
+// `&str` beats `&&T`, which beats `&T`/`&mut T`, which beat anything.
 #[doc(hidden)]
 pub struct Wrap<R>(std::cell::Cell<Option<R>>);
 
@@ -129,6 +130,36 @@ impl<'a, T: Reflect> ViaMut<'a> for &Wrap<&'a mut T> {
     }
 }
 
+#[doc(hidden)]
+pub trait ViaOpaque<'a> {
+    fn local(&self, name: &'static str) -> Local<'a>;
+}
+
+/// Stands in for values without `Reflect`, so they still show up.
+#[derive(Reflect)]
+#[reflect(type_path = false)]
+struct Opaque;
+
+impl bevy_reflect::TypePath for Opaque {
+    fn type_path() -> &'static str {
+        "opaque"
+    }
+
+    fn short_type_path() -> &'static str {
+        "<no Reflect>"
+    }
+}
+
+impl<'a, R> ViaOpaque<'a> for Wrap<R> {
+    fn local(&self, name: &'static str) -> Local<'a> {
+        let type_name = std::any::type_name::<R>()
+            .trim_start_matches('&')
+            .trim_start_matches("mut ")
+            .trim_start_matches('&');
+        Local::copied(name, type_name, Opaque)
+    }
+}
+
 /// Stops here so a `peephole` REPL can inspect the listed variables.
 /// Their types must derive [`Reflect`].
 ///
@@ -145,7 +176,7 @@ impl<'a, T: Reflect> ViaMut<'a> for &Wrap<&'a mut T> {
 macro_rules! inspect {
     ($($args:tt)*) => {{
         #[allow(unused_imports)]
-        use $crate::{ViaMut as _, ViaShared as _, ViaSharedRef as _, ViaStr as _};
+        use $crate::{ViaMut as _, ViaOpaque as _, ViaShared as _, ViaSharedRef as _, ViaStr as _};
         $crate::stop(
             &$crate::Location {
                 file: ::core::file!(),
