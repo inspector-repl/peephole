@@ -56,7 +56,7 @@ fn register_methods(item: TokenStream) -> syn::Result<TokenStream> {
         return Ok(block.into_token_stream());
     }
     let self_ty = &block.self_ty;
-    let owner = if let Some((_, path, _)) = &block.trait_ {
+    let owner = if let Some((path, _)) = &block.trait_ {
         quote!(<#self_ty as #path>)
     } else {
         quote!(<#self_ty>)
@@ -68,7 +68,7 @@ fn register_methods(item: TokenStream) -> syn::Result<TokenStream> {
         let sig = &method.sig;
         let plain = sig.receiver().is_some()
             && sig.asyncness.is_none()
-            && sig.unsafety.is_none()
+            && matches!(sig.safety, syn::Safety::Default)
             && sig.generics.type_params().next().is_none()
             && sig.generics.const_params().next().is_none();
         if !plain {
@@ -105,9 +105,12 @@ fn expand(item: TokenStream) -> syn::Result<TokenStream> {
     for input in &function.sig.inputs {
         match input {
             FnArg::Receiver(receiver) => {
-                let access = match (&receiver.reference, receiver.mutability) {
-                    (Some(_), Some(_)) => Access::DerefMut,
-                    (None, Some(_)) => Access::Mut,
+                let access = match &receiver.kind {
+                    syn::ReceiverKind::Reference(_, _, Some(_)) => Access::DerefMut,
+                    syn::ReceiverKind::Typed(_, ty) if matches!(&**ty, Type::Reference(r) if r.mutability.is_some()) => {
+                        Access::DerefMut
+                    }
+                    syn::ReceiverKind::Value if receiver.mutability.is_some() => Access::Mut,
                     _ => Access::Shared,
                 };
                 params.push(Binding {
@@ -160,6 +163,7 @@ fn bind(pat: &Pat, out: &mut Vec<Binding>) {
         Pat::Type(typed) => bind_typed(&typed.pat, &typed.ty, out),
         Pat::Reference(reference) => bind(&reference.pat, out),
         Pat::Paren(paren) => bind(&paren.pat, out),
+        Pat::Guard(guarded) => bind(&guarded.pat, out),
         Pat::Tuple(tuple) => tuple.elems.iter().for_each(|p| bind(p, out)),
         Pat::TupleStruct(tuple) => tuple.elems.iter().for_each(|p| bind(p, out)),
         Pat::Slice(slice) => slice.elems.iter().for_each(|p| bind(p, out)),
@@ -362,8 +366,8 @@ impl VisitMut for Scopes {
                     let mut frame = hidden(&choice.expr);
                     bind(&arm.pat, &mut frame);
                     self.within(frame, |s| {
-                        if let Some((_, guard)) = &mut arm.guard {
-                            s.visit_expr_mut(guard);
+                        if let Pat::Guard(guarded) = &mut arm.pat {
+                            s.visit_expr_mut(&mut guarded.guard);
                         }
                         s.visit_expr_mut(&mut arm.body);
                     });
