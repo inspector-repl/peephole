@@ -8,9 +8,15 @@ use peephole::bevy_reflect;
 #[derive(peephole::Reflect)]
 struct Order { id: u64, items: Vec<Item>, status: Status }
 
+#[peephole::methods]
+impl Order {
+    fn total(&self) -> f64 { … }
+}
+
+#[peephole::scope]
 fn checkout(order: &mut Order) {
     let mut retries = 3;
-    peephole::inspect!(mut *order, retries);
+    peephole::inspect!();
 }
 ```
 
@@ -20,7 +26,7 @@ waiting for a program to reach peephole::inspect!(…)
 stopped at src/main.rs:42 in shop::checkout · pid 4711 · thread main
    40 │ fn checkout(order: &mut Order) {
    41 │     let mut retries = 3;
-▶  42 │     peephole::inspect!(mut *order, retries);
+▶  42 │     peephole::inspect!();
    43 │ }
 locals:
   order    Order  Order { id: 7, items: [Item { name: "apple", qty: 3, price:…
@@ -51,8 +57,36 @@ needs `use peephole::bevy_reflect;`. If a `build.rs` includes those
 modules, add peephole to `[build-dependencies]` too.
 
 `inspect!` stops only while a `peephole` REPL listens. Otherwise it
-returns at once, so it can stay in debug builds. Variables are read-only
-unless marked `mut`:
+returns at once, so it can stay in debug builds.
+
+With `#[peephole::scope]` on the function, an empty `inspect!()` lists
+every variable in scope at that point:
+
+```rust
+#[peephole::scope]
+fn checkout(order: &mut Order, attempts: &mut u32) {
+    let names = load_names();
+    peephole::inspect!(); // inspect!(mut *order, mut *attempts, names)
+}
+```
+
+`let mut` bindings and `&mut` parameters become writable, everything
+else is read-only. Variables without `Reflect` show as `<no Reflect>`.
+Inside a loop or `match`, the variables its head expression uses are
+left out, since the loop or match may hold a borrow of them. Closures
+and async blocks only list their own variables.
+
+The attribute sees syntax, not types, so two cases need help:
+
+- A value moved earlier, as in `drop(v)`, fails with "borrow of moved
+  value". Leave it out with `inspect!(!v)`.
+- Types holding borrowed data, like `Vec<&str>`, fail with "borrowed
+  data escapes". Leave them out the same way.
+
+### Listing variables by hand
+
+Without the attribute, or to pick what is shown, list the variables.
+An explicit list is never changed by `#[peephole::scope]`:
 
 ```rust
 fn handle(device: &Device, dir: &Path, counter: &mut u32, name: &str) {
@@ -66,34 +100,6 @@ fn handle(device: &Device, dir: &Path, counter: &mut u32, name: &str) {
     );
 }
 ```
-
-### Finding the variables automatically
-
-With `#[peephole::scope]` on the function, an empty `inspect!()` lists
-every variable in scope at that point:
-
-```rust
-#[peephole::scope]
-fn checkout(order: &mut Order, attempts: &mut u32) {
-    let names = load_names();
-    peephole::inspect!(); // inspect!(mut *order, mut *attempts, names)
-}
-```
-
-`let mut` bindings and `&mut` parameters become writable. Variables
-without `Reflect` show as `<no Reflect>`. Inside a loop or `match`, the
-variables its head expression uses are left out, since the loop or match
-may hold a borrow of them. Closures and async blocks only list their own
-variables.
-
-The attribute sees syntax, not types, so two cases need help:
-
-- A value moved earlier, as in `drop(v)`, fails with "borrow of moved
-  value". Leave it out with `inspect!(!v)`.
-- Types holding borrowed data, like `Vec<&str>`, fail with "borrowed
-  data escapes". Leave them out the same way.
-
-An explicit list, `inspect!(a, mut b)`, is never changed.
 
 Fields of foreign types that don't implement `Reflect` need
 `#[reflect(ignore)]`. If their fields are public, bevy_reflect's
