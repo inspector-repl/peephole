@@ -14,7 +14,7 @@ path = "src/main.rs"
 peephole-protocol.workspace = true
 serde_json.workspace = true
 nix = { workspace = true, features = ["process", "signal", "term"] }
-rustyline = { version = "17", default-features = false, features = ["with-file-history"] }
+rustyline = { version = "19", default-features = false, features = ["with-file-history"] }
 
 [dev-dependencies]
 peephole-protocol.workspace = true
