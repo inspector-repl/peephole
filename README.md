@@ -2,6 +2,8 @@
 
 Stop a running Rust program and explore its variables from a REPL.
 
+![peephole stopping the demo program, then exploring and changing its variables](docs/demo.gif)
+
 ```rust
 use peephole::bevy_reflect;
 
