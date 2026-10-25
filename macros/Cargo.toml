@@ -1,6 +1,6 @@
 [package]
 name = "peephole-macros"
-description = "The #[peephole::scope] attribute"
+description = "The #[peephole::scope] and #[peephole::methods] attributes"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
