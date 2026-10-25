@@ -31,11 +31,31 @@ stopped at src/main.rs:42 in shop::checkout · pid 4711 · thread main
 locals:
   order    Order  Order { id: 7, items: [Item { name: "apple", qty: 3, price:…
   retries  i32    3
+main.rs:42> .ls order
+Order
+  id      u64        7
+  items   Vec<Item>  [Item { name: "apple", qty: 3, price: 0.5 }, Item { name: "…
+  status  Status     Shipped { tracking: "XY123" }
+methods: type_name()  keys()  total()
 main.rs:42> order.items[0].qty = 10
 main.rs:42> order.total()
 6.5
 main.rs:42> order.items.map(|i| i.name)
 ["apple", "pear"]
+main.rs:42> .help
+Type Rhai expressions or statements. Program variables are live: assignments
+change the program. Tab completes, a grey hint previews the value of a path.
+
+  .continue, .c   resume the program and wait for the next stop
+  .quit, .q       resume the program and exit (also Ctrl-D)
+  .where, .w [N]  show the stop again, with N lines of source around it
+  .ls [path]      fields, previews and methods of a value, or all locals
+  .edit           write input in $EDITOR, run it when the editor exits
+  .edit path      edit a value in $EDITOR, assign it back when it exits
+  .edit .         open the source at the stop in $EDITOR
+  .help           this text
+
+Ctrl-C clears the line, or interrupts a running input.
 main.rs:42> .c
 ```
 

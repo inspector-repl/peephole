@@ -159,7 +159,13 @@ pub fn ls(session: &Session, expr: &str) -> Value {
             .collect();
         let functions: Vec<String> = exposed()
             .into_iter()
-            .map(|(name, _)| format!("{name}()"))
+            .map(|(name, receiver)| match render::short_type(&receiver) {
+                // Methods of different types may share a name.
+                ty if ty.chars().next().is_some_and(char::is_uppercase) => {
+                    format!("{ty}.{name}()")
+                }
+                _ => format!("{name}()"),
+            })
             .collect();
         return json!({"fields": fields, "functions": functions});
     }
