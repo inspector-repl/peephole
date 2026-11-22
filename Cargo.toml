@@ -12,7 +12,7 @@ repository = "https://github.com/inspector-repl/peephole"
 peephole-protocol = { path = "protocol" }
 peephole-macros = { path = "macros" }
 serde_json = "1"
-nix = { version = "0.31", default-features = false }
+nix = { version = "0.32", default-features = false }
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
